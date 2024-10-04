@@ -1,11 +1,17 @@
 #include <entt/entt.hpp>
 #include <glm/glm.hpp>
-#include <Fwog/Context.h>
+#include <glm/gtc/quaternion.hpp>
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 #include <glad/gl.h>
 #include <GLFW/glfw3.h>
+
+#include <Fwog/Context.h>
+#include <Fwog/DebugMarker.h>
+#include <Fwog/Shader.h>
+#include <Fwog/Pipeline.h>
+#include <Fwog/Buffer.h>
 
 #include <miniaudio.h>
 
@@ -29,7 +35,156 @@ namespace
 
   namespace Render
   {
-    
+    using index_t = uint32_t;
+
+    struct Vertex
+    {
+      glm::vec3 position{};
+      glm::vec3 normal{};
+      glm::vec3 texcoord{};
+    };
+
+    struct Mesh
+    {
+      std::optional<Fwog::TypedBuffer<Vertex>> vertexBuffer;
+      std::optional<Fwog::TypedBuffer<index_t>> indexBuffer;
+    };
+
+    struct InstanceUniforms
+    {
+      glm::mat4 world_from_object;
+    };
+
+    struct FrameUniforms
+    {
+      glm::mat4 clip_from_world;
+    };
+
+    std::optional<Fwog::GraphicsPipeline> pipeline;
+    std::optional<Fwog::TypedBuffer<InstanceUniforms>> instanceBuffer;
+    std::optional<Fwog::TypedBuffer<FrameUniforms>> frameUniformsBuffer;
+
+    // Shaders
+    namespace
+    {
+      const char* sceneVertexSource = R"(
+#version 460 core
+
+struct Vertex
+{
+  float px, py, pz;
+  float nx, ny, nz;
+  float tx, ty;
+};
+
+layout(binding = 0, std430) readonly buffer VertexBuffer
+{
+  Vertex vertices[];
+};
+
+layout(binding = 1, std430) readonly buffer FrameUniforms
+{
+  mat4 clip_from_world;
+}frame;
+
+struct InstanceUniforms
+{
+  mat4 world_from_object;
+};
+
+layout(binding = 2, std430) readonly buffer InstanceBuffer
+{
+  InstanceUniforms instances[];
+};
+
+layout(location = 0) out vec3 v_position;
+layout(location = 1) out vec3 v_normal;
+layout(location = 2) out vec2 v_texcoord;
+
+void main()
+{
+  Vertex v = vertices[gl_VertexID];
+
+  const vec3 posObj = vec3(v.px, v.py, v.pz);
+  const vec3 normObj = vec3(v.nx, v.ny, v.nz);
+
+  InstanceUniforms instance = instances[gl_InstanceID + gl_BaseInstance];
+
+  v_position = (instance.world_from_object * vec4(posObj, 1.0)).xyz;
+  v_normal   = transpose(inverse(mat3(instance.world_from_object))) * normObj;
+  v_texcoord = vec2(v.tx, v.ty);
+
+  gl_Position = frame.clip_from_world * vec4(v_position, 1.0);
+}
+)";
+
+      const char* sceneFragmentSource = R"(
+#version 460 core
+
+layout(location = 0) out vec4 o_color;
+
+layout(location = 0) in vec3 v_position;
+layout(location = 1) in vec3 v_normal;
+layout(location = 2) in vec2 v_texcoord;
+
+void main()
+{
+  o_color = vec4(v_normal * .5 + .5, 1.0);
+}
+)";
+    }
+  }
+
+  namespace Game
+  {
+    namespace ECS
+    {
+      // Components below here
+      struct Name
+      {
+        std::string string;
+      };
+
+      struct Transform
+      {
+        glm::vec3 position = { 0, 0, 0 };
+        glm::quat rotation = { 1, 0, 0, 0 };
+        glm::vec3 scale = { 1, 1, 1 };
+      };
+
+      struct MeshRef
+      {
+        Render::Mesh* mesh{};
+      };
+    }
+
+    struct View
+    {
+      glm::vec3 position{};
+      float pitch{}; // pitch angle in radians
+      float yaw{};   // yaw angle in radians
+
+      glm::vec3 GetForwardDir() const
+      {
+        return glm::vec3{ cos(pitch) * cos(yaw), sin(pitch), cos(pitch) * sin(yaw) };
+      }
+
+      glm::mat4 GetViewMatrix() const
+      {
+        // TODO: express view matrix without lookAt
+        return glm::lookAt(position, position + GetForwardDir(), glm::vec3(0, 1, 0));
+      }
+    };
+
+
+    View mainCamera{};
+    float cursorSensitivity = 0.0025f;
+    float cameraSpeed = 4.5f;
+
+    // Game objects
+    entt::registry registry;
+    Render::Mesh testMesh;
+    entt::entity testEntity;
   }
 }
 
@@ -177,101 +332,202 @@ namespace
   }
 }
 
-void InitializeApplication()
+// Application
+namespace
 {
-  if (glfwInit() != GLFW_TRUE)
+  void InitializeApplication()
   {
-    throw std::exception("Failed to initialize GLFW");
+    if (glfwInit() != GLFW_TRUE)
+    {
+      throw std::exception("Failed to initialize GLFW");
+    }
+
+    glfwSetErrorCallback([](int, const char* msg) { printf("GLFW error: %s\n", msg); });
+
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_MAXIMIZED, false);
+    glfwWindowHint(GLFW_DECORATED, true);
+    glfwWindowHint(GLFW_DOUBLEBUFFER, GLFW_TRUE);
+    glfwWindowHint(GLFW_SRGB_CAPABLE, GLFW_TRUE);
+    glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, GLFW_TRUE);
+
+    GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+    if (!monitor)
+    {
+      throw std::runtime_error("Failed to find monitor");
+    }
+    const GLFWvidmode* videoMode = glfwGetVideoMode(monitor);
+    // TODO: update app title
+    App::window = glfwCreateWindow(static_cast<int>(videoMode->width * .75), static_cast<int>(videoMode->height * .75), "LD56", nullptr, nullptr);
+    if (!App::window)
+    {
+      glfwTerminate();
+      throw std::runtime_error("Failed to create window");
+    }
+
+    glfwGetFramebufferSize(App::window, &App::windowSize.x, &App::windowSize.y);
+
+    int monitorLeft{};
+    int monitorTop{};
+    glfwGetMonitorPos(monitor, &monitorLeft, &monitorTop);
+
+    // Center window on the monitor
+    glfwSetWindowPos(App::window, videoMode->width / 2 - App::windowSize.x / 2 + monitorLeft, videoMode->height / 2 - App::windowSize.y / 2 + monitorTop);
+
+    glfwMakeContextCurrent(App::window);
+
+    // vsync
+    glfwSwapInterval(1);
+
+    glfwSetCursorPosCallback(App::window, CursorPosCallback);
+    glfwSetCursorEnterCallback(App::window, CursorEnterCallback);
+    glfwSetFramebufferSizeCallback(App::window, WindowResizeCallback);
+
+    //auto fwogCallback = [](std::string_view msg) { printf("Fwog: %.*s\n", static_cast<int>(msg.size()), msg.data()); };
+    auto fwogCallback = nullptr;
+    Fwog::Initialize({
+      .glLoadFunc = glfwGetProcAddress,
+      .verboseMessageCallback = fwogCallback,
+      });
+
+    // Set up the GL debug message callback.
+    glEnable(GL_DEBUG_OUTPUT);
+    glDebugMessageCallback(OpenglErrorCallback, nullptr);
+    glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+    glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, nullptr, GL_TRUE);
+
+    ImGui::CreateContext();
+    ImGui_ImplGlfw_InitForOpenGL(App::window, true);
+    ImGui_ImplOpenGL3_Init();
+    ImGui::StyleColorsDark();
+
+    glfwSetInputMode(App::window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
   }
 
-  glfwSetErrorCallback([](int, const char* msg) { printf("GLFW error: %s\n", msg); });
-
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
-  glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-  glfwWindowHint(GLFW_MAXIMIZED, false);
-  glfwWindowHint(GLFW_DECORATED, true);
-  glfwWindowHint(GLFW_DOUBLEBUFFER, GLFW_TRUE);
-  glfwWindowHint(GLFW_SRGB_CAPABLE, GLFW_TRUE);
-  glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, GLFW_TRUE);
-
-  GLFWmonitor* monitor = glfwGetPrimaryMonitor();
-  if (!monitor)
-  {
-    throw std::runtime_error("Failed to find monitor");
-  }
-  const GLFWvidmode* videoMode = glfwGetVideoMode(monitor);
-  // TODO: update app title
-  App::window = glfwCreateWindow(static_cast<int>(videoMode->width * .75), static_cast<int>(videoMode->height * .75), "LD56", nullptr, nullptr);
-  if (!App::window)
+  void TerminateApplication()
   {
     glfwTerminate();
-    throw std::runtime_error("Failed to create window");
+  }
+}
+
+// Graphics
+namespace
+{
+  void InitializeRenderer()
+  {
+    auto vertexShader = Fwog::Shader(Fwog::PipelineStage::VERTEX_SHADER, Render::sceneVertexSource);
+    auto fragmentShader = Fwog::Shader(Fwog::PipelineStage::FRAGMENT_SHADER, Render::sceneFragmentSource);
+    Render::pipeline = Fwog::GraphicsPipeline({
+      .vertexShader = &vertexShader,
+      .fragmentShader = &fragmentShader,
+      .depthState = {.depthTestEnable = true, .depthWriteEnable = true,},
+      });
   }
 
-  glfwGetFramebufferSize(App::window, &App::windowSize.x, &App::windowSize.y);
+  void TerminateRenderer()
+  {
+    Render::pipeline.reset();
+    Fwog::Terminate();
+  }
 
-  int monitorLeft{};
-  int monitorTop{};
-  glfwGetMonitorPos(monitor, &monitorLeft, &monitorTop);
+  void TickRender([[maybe_unused]] double dt)
+  {
+    auto renderMarker = Fwog::ScopedDebugMarker("TickRender");
 
-  // Center window on the monitor
-  glfwSetWindowPos(App::window, videoMode->width / 2 - App::windowSize.x / 2 + monitorLeft, videoMode->height / 2 - App::windowSize.y / 2 + monitorTop);
+    glEnable(GL_FRAMEBUFFER_SRGB);
 
-  glfwMakeContextCurrent(App::window);
+    Fwog::RenderToSwapchain(
+      Fwog::SwapchainRenderInfo{
+        .name = "Render Triangle",
+        .viewport = Fwog::Viewport{.drawRect{.offset = {0, 0}, .extent = {(uint32_t)App::windowSize.x, (uint32_t)App::windowSize.y}}},
+        .colorLoadOp = Fwog::AttachmentLoadOp::CLEAR,
+        .clearColorValue = {.2f, .0f, .2f, 1.0f},
+      },
+      [&]
+      {
+        Fwog::Cmd::BindGraphicsPipeline(Render::pipeline.value());
+        // Iterate game objects with mesh and transform, then render them
+      });
 
-  // vsync
-  glfwSwapInterval(1);
-
-  glfwSetCursorPosCallback(App::window, CursorPosCallback);
-  glfwSetCursorEnterCallback(App::window, CursorEnterCallback);
-  glfwSetFramebufferSizeCallback(App::window, WindowResizeCallback);
-
-  //auto fwogCallback = [](std::string_view msg) { printf("Fwog: %.*s\n", static_cast<int>(msg.size()), msg.data()); };
-  auto fwogCallback = nullptr;
-  Fwog::Initialize({
-    .glLoadFunc = glfwGetProcAddress,
-    .verboseMessageCallback = fwogCallback,
-    });
-
-  // Set up the GL debug message callback.
-  glEnable(GL_DEBUG_OUTPUT);
-  glDebugMessageCallback(OpenglErrorCallback, nullptr);
-  glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
-  glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, nullptr, GL_TRUE);
-
-  ImGui::CreateContext();
-  ImGui_ImplGlfw_InitForOpenGL(App::window, true);
-  ImGui_ImplOpenGL3_Init();
-  ImGui::StyleColorsDark();
-
-  glfwSetInputMode(App::window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-}
-
-void InitializeRenderer()
-{
-  
-}
-
-void TickGame([[maybe_unused]] double dt)
-{
-  
-}
-
-void TickRender([[maybe_unused]] double dt)
-{
-  Fwog::RenderToSwapchain(
-    Fwog::SwapchainRenderInfo{
-      .name = "Render Triangle",
-      .viewport = Fwog::Viewport{.drawRect{.offset = {0, 0}, .extent = {(uint32_t)App::windowSize.x, (uint32_t)App::windowSize.y}}},
-      .colorLoadOp = Fwog::AttachmentLoadOp::CLEAR,
-      .clearColorValue = {.2f, .0f, .2f, 1.0f},
-    },
-    [&]
+    ImGui::Render();
+    auto* imguiDrawData = ImGui::GetDrawData();
+    if (imguiDrawData->CmdListsCount > 0)
     {
-    });
+      auto marker = Fwog::ScopedDebugMarker("UI");
+      glDisable(GL_FRAMEBUFFER_SRGB);
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      ImGui_ImplOpenGL3_RenderDrawData(imguiDrawData);
+    }
+    glfwSwapBuffers(App::window);
+  }
 
-  glfwSwapBuffers(App::window);
+  void TickUI(double dt)
+  {
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
+
+    ImGui::Text("FPS: %.0f", 1 / dt);
+  }
+}
+
+// Game
+namespace
+{
+  void InitializeGame()
+  {
+    Game::testEntity = Game::registry.create();
+    Game::registry.emplace<Game::ECS::Name>(Game::testEntity).string = "Hello";
+    auto& transform = Game::registry.emplace<Game::ECS::Transform>(Game::testEntity);
+
+    transform.position = { 0, 0, 0 };
+
+    Game::registry.emplace<Game::ECS::MeshRef>(Game::testEntity).mesh = &Game::testMesh;
+
+    Render::Vertex vertices[] = {
+      Render::Vertex{{0, 0, 0}},
+      Render::Vertex{{1, -1, 0}},
+      Render::Vertex{{1, 1, 0}},
+    };
+    uint32_t indices[] = { 0, 1, 2 };
+
+    Game::testMesh.vertexBuffer.emplace(std::size(vertices));
+    Game::testMesh.indexBuffer.emplace(std::size(indices));
+  }
+
+  void TerminateGame()
+  {
+
+  }
+
+  void TickGameFixed([[maybe_unused]] double dt)
+  {
+
+  }
+
+  void TickGameVariable([[maybe_unused]] double dt)
+  {
+    const float dtf = static_cast<float>(dt);
+    const glm::vec3 forward = Game::mainCamera.GetForwardDir();
+    const glm::vec3 right = glm::normalize(glm::cross(forward, { 0, 1, 0 }));
+    if (glfwGetKey(App::window, GLFW_KEY_W) == GLFW_PRESS)
+      Game::mainCamera.position += forward * dtf * Game::cameraSpeed;
+    if (glfwGetKey(App::window, GLFW_KEY_S) == GLFW_PRESS)
+      Game::mainCamera.position -= forward * dtf * Game::cameraSpeed;
+    if (glfwGetKey(App::window, GLFW_KEY_D) == GLFW_PRESS)
+      Game::mainCamera.position += right * dtf * Game::cameraSpeed;
+    if (glfwGetKey(App::window, GLFW_KEY_A) == GLFW_PRESS)
+      Game::mainCamera.position -= right * dtf * Game::cameraSpeed;
+    if (glfwGetKey(App::window, GLFW_KEY_Q) == GLFW_PRESS)
+      Game::mainCamera.position.y -= dtf * Game::cameraSpeed;
+    if (glfwGetKey(App::window, GLFW_KEY_E) == GLFW_PRESS)
+      Game::mainCamera.position.y += dtf * Game::cameraSpeed;
+    Game::mainCamera.yaw += static_cast<float>(App::cursorOffset.x * Game::cursorSensitivity);
+    Game::mainCamera.pitch += static_cast<float>(App::cursorOffset.y * Game::cursorSensitivity);
+    Game::mainCamera.pitch = glm::clamp(Game::mainCamera.pitch, -glm::half_pi<float>() + 1e-4f, glm::half_pi<float>() - 1e-4f);
+  }
 }
 
 void MainLoop()
@@ -292,9 +548,11 @@ void MainLoop()
     {
       gameTickAccum -= GAME_TICK;
 
-      TickGame(dt);
+      TickGameFixed(dt);
     }
 
+    TickGameVariable(dt);
+    TickUI(dt);
     TickRender(dt);
   }
 }
@@ -303,12 +561,9 @@ int main()
 {
   InitializeApplication();
   InitializeRenderer();
+  InitializeGame();
   MainLoop();
-
-  //gladLoadGL(glfwGetProcAddress);
-  //ImGui::Button("asdf");
-  //Fwog::Initialize();
-  //entt::registry asdf;
-  //[[maybe_unused]] auto asdff = asdf.create();
-  //glm::vec3{};
+  TerminateGame();
+  TerminateRenderer();
+  TerminateApplication();
 }

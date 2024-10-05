@@ -943,7 +943,7 @@ void MainLoop()
     {
       gameTickAccum -= GAME_TICK;
 
-      TickGameFixed(dt);
+      TickGameFixed(GAME_TICK);
     }
 
     TickGameVariable(dt);

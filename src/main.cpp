@@ -41,13 +41,14 @@ namespace
     {
       glm::vec3 position{};
       glm::vec3 normal{};
-      glm::vec3 texcoord{};
+      glm::vec2 texcoord{};
     };
 
     struct Mesh
     {
       std::optional<Fwog::TypedBuffer<Vertex>> vertexBuffer;
       std::optional<Fwog::TypedBuffer<index_t>> indexBuffer;
+      uint32_t indexCount = 0;
     };
 
     struct InstanceUniforms
@@ -77,6 +78,11 @@ struct Vertex
   float tx, ty;
 };
 
+struct InstanceUniforms
+{
+  mat4 world_from_object;
+};
+
 layout(binding = 0, std430) readonly buffer VertexBuffer
 {
   Vertex vertices[];
@@ -86,11 +92,6 @@ layout(binding = 1, std430) readonly buffer FrameUniforms
 {
   mat4 clip_from_world;
 }frame;
-
-struct InstanceUniforms
-{
-  mat4 world_from_object;
-};
 
 layout(binding = 2, std430) readonly buffer InstanceBuffer
 {
@@ -129,7 +130,8 @@ layout(location = 2) in vec2 v_texcoord;
 
 void main()
 {
-  o_color = vec4(v_normal * .5 + .5, 1.0);
+  //o_color = vec4(v_normal * .5 + .5, 1.0);
+  o_color = vec4(1.0);
 }
 )";
     }
@@ -162,7 +164,7 @@ void main()
     {
       glm::vec3 position{};
       float pitch{}; // pitch angle in radians
-      float yaw{};   // yaw angle in radians
+      float yaw = -glm::half_pi<float>();   // yaw angle in radians
 
       glm::vec3 GetForwardDir() const
       {
@@ -360,7 +362,7 @@ namespace
     }
     const GLFWvidmode* videoMode = glfwGetVideoMode(monitor);
     // TODO: update app title
-    App::window = glfwCreateWindow(static_cast<int>(videoMode->width * .75), static_cast<int>(videoMode->height * .75), "LD56", nullptr, nullptr);
+    App::window = glfwCreateWindow(static_cast<int>(videoMode->width * .75), static_cast<int>(videoMode->height * .75), "MyMfFrogEngine", nullptr, nullptr);
     if (!App::window)
     {
       glfwTerminate();
@@ -403,7 +405,8 @@ namespace
     ImGui_ImplOpenGL3_Init();
     ImGui::StyleColorsDark();
 
-    glfwSetInputMode(App::window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+    //glfwSetInputMode(App::window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+    glfwSetInputMode(App::window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
   }
 
   void TerminateApplication()
@@ -422,12 +425,17 @@ namespace
     Render::pipeline = Fwog::GraphicsPipeline({
       .vertexShader = &vertexShader,
       .fragmentShader = &fragmentShader,
+      .rasterizationState = {.cullMode = Fwog::CullMode::NONE,},
       .depthState = {.depthTestEnable = true, .depthWriteEnable = true,},
       });
+
+    Render::frameUniformsBuffer.emplace(Fwog::BufferStorageFlag::DYNAMIC_STORAGE);
   }
 
   void TerminateRenderer()
   {
+    Render::instanceBuffer.reset();
+    Render::frameUniformsBuffer.reset();
     Render::pipeline.reset();
     Fwog::Terminate();
   }
@@ -444,11 +452,51 @@ namespace
         .viewport = Fwog::Viewport{.drawRect{.offset = {0, 0}, .extent = {(uint32_t)App::windowSize.x, (uint32_t)App::windowSize.y}}},
         .colorLoadOp = Fwog::AttachmentLoadOp::CLEAR,
         .clearColorValue = {.2f, .0f, .2f, 1.0f},
+        .depthLoadOp = Fwog::AttachmentLoadOp::CLEAR,
+        .clearDepthValue = 1.0f,
       },
       [&]
       {
+        auto projection = glm::perspective(glm::radians(60.0f), (float)App::windowSize.x / (float)App::windowSize.y, 0.1f, 100.0f);
+        Render::frameUniformsBuffer->UpdateData(Render::FrameUniforms{.clip_from_world = projection * Game::mainCamera.GetViewMatrix()});
+
+        struct Instance
+        {
+          size_t index;
+          Render::Mesh* mesh;
+        };
+
+        auto instanceData = std::vector<Render::InstanceUniforms>();
+        auto instances = std::vector<Instance>();
+
+        auto view = Game::registry.view<Game::ECS::Transform, Game::ECS::MeshRef>();
+        for (auto&& [entity, transform, meshRef] : view.each())
+        {
+          instances.emplace_back(instanceData.size(), meshRef.mesh);
+          instanceData.emplace_back(glm::translate(glm::identity<glm::mat4>(), transform.position) * glm::mat4_cast(transform.rotation) * glm::scale(glm::identity<glm::mat4>(), transform.scale));
+        }
+
+        if (!Render::instanceBuffer || Render::instanceBuffer->Size() < instances.size() * sizeof(Render::InstanceUniforms))
+        {
+          Render::instanceBuffer.emplace(instanceData.size() * 3 / 2, Fwog::BufferStorageFlag::DYNAMIC_STORAGE, "Instance Data");
+        }
+
+        if (!instanceData.empty())
+        {
+          Render::instanceBuffer->UpdateData(instanceData);
+        }
+
         Fwog::Cmd::BindGraphicsPipeline(Render::pipeline.value());
-        // Iterate game objects with mesh and transform, then render them
+        Fwog::Cmd::BindStorageBuffer(1, Render::frameUniformsBuffer.value());
+        Fwog::Cmd::BindStorageBuffer(2, Render::instanceBuffer.value());
+
+        for (size_t i = 0; i < instances.size(); i++)
+        {
+          const auto& instance = instances[i];
+          Fwog::Cmd::BindIndexBuffer(instance.mesh->indexBuffer.value(), Fwog::IndexType::UNSIGNED_INT);
+          Fwog::Cmd::BindStorageBuffer(0, instance.mesh->vertexBuffer.value());
+          Fwog::Cmd::DrawIndexed(instance.mesh->indexCount, 1, 0, 0, (uint32_t)i);
+        }
       });
 
     ImGui::Render();
@@ -470,6 +518,9 @@ namespace
     ImGui::NewFrame();
 
     ImGui::Text("FPS: %.0f", 1 / dt);
+    ImGui::Text("Camera pos: (%.1f, %.1f, %.1f)", Game::mainCamera.position.x, Game::mainCamera.position.y, Game::mainCamera.position.z);
+    ImGui::Text("Camera dir: (%.1f, %.1f, %.1f)", Game::mainCamera.GetForwardDir().x, Game::mainCamera.GetForwardDir().y, Game::mainCamera.GetForwardDir().z);
+    ImGui::Text("Camera euler: yaw: %.2f, pitch: %.2f", Game::mainCamera.yaw, Game::mainCamera.pitch);
   }
 }
 
@@ -482,7 +533,7 @@ namespace
     Game::registry.emplace<Game::ECS::Name>(Game::testEntity).string = "Hello";
     auto& transform = Game::registry.emplace<Game::ECS::Transform>(Game::testEntity);
 
-    transform.position = { 0, 0, 0 };
+    transform.position = { 0, 0, -1 };
 
     Game::registry.emplace<Game::ECS::MeshRef>(Game::testEntity).mesh = &Game::testMesh;
 
@@ -493,13 +544,15 @@ namespace
     };
     uint32_t indices[] = { 0, 1, 2 };
 
-    Game::testMesh.vertexBuffer.emplace(std::size(vertices));
-    Game::testMesh.indexBuffer.emplace(std::size(indices));
+    Game::testMesh.vertexBuffer.emplace(std::span<const Render::Vertex>(vertices));
+    Game::testMesh.indexBuffer.emplace(std::span<const uint32_t>(indices));
+    Game::testMesh.indexCount = std::size(indices);
   }
 
   void TerminateGame()
   {
-
+    Game::testMesh.vertexBuffer.reset();
+    Game::testMesh.indexBuffer.reset();
   }
 
   void TickGameFixed([[maybe_unused]] double dt)
@@ -541,6 +594,7 @@ void MainLoop()
     auto dt = curTime - prevTime;
     prevTime = curTime;
 
+    App::cursorOffset = {};
     glfwPollEvents();
 
     gameTickAccum += dt;

@@ -6,6 +6,7 @@
 #include <imgui_impl_opengl3.h>
 #include <glad/gl.h>
 #include <GLFW/glfw3.h>
+#include <tiny_obj_loader.h>
 
 #include <Fwog/Context.h>
 #include <Fwog/DebugMarker.h>
@@ -15,11 +16,28 @@
 
 #include <miniaudio.h>
 
+#include <Jolt/Jolt.h>
+#include <Jolt/RegisterTypes.h>
+#include <Jolt/Core/Factory.h>
+#include <Jolt/Core/TempAllocator.h>
+#include <Jolt/Core/JobSystemThreadPool.h>
+#include <Jolt/Physics/PhysicsSettings.h>
+#include <Jolt/Physics/PhysicsSystem.h>
+#include <Jolt/Physics/Collision/Shape/BoxShape.h>
+#include <Jolt/Physics/Collision/Shape/SphereShape.h>
+#include <Jolt/Physics/Body/BodyCreationSettings.h>
+#include <Jolt/Physics/Body/BodyActivationListener.h>
+
+#include <numeric>
 #include <filesystem>
 #include <optional>
 #include <iostream>
 #include <fstream>
 #include <exception>
+#include <thread>
+#include <unordered_map>
+
+using namespace JPH::literals;
 
 // Globals
 namespace
@@ -130,11 +148,121 @@ layout(location = 2) in vec2 v_texcoord;
 
 void main()
 {
-  //o_color = vec4(v_normal * .5 + .5, 1.0);
-  o_color = vec4(1.0);
+  o_color = vec4(v_normal * .5 + .5, 1.0);
+  //o_color = vec4(1.0);
 }
 )";
     }
+  }
+
+  namespace Physics
+  {
+    namespace
+    {
+      namespace Layers
+      {
+        constexpr JPH::ObjectLayer NON_MOVING = 0;
+        constexpr JPH::ObjectLayer MOVING = 1;
+        constexpr JPH::ObjectLayer NUM_LAYERS = 2;
+      };
+
+      namespace BroadPhaseLayers
+      {
+        constexpr JPH::BroadPhaseLayer NON_MOVING(0);
+        constexpr JPH::BroadPhaseLayer MOVING(1);
+        constexpr JPH::uint NUM_LAYERS(2);
+      };
+
+      class ObjectLayerPairFilterImpl : public JPH::ObjectLayerPairFilter
+      {
+      public:
+        bool ShouldCollide(JPH::ObjectLayer inObject1, JPH::ObjectLayer inObject2) const override
+        {
+          switch (inObject1)
+          {
+          case Layers::NON_MOVING:
+            return inObject2 == Layers::MOVING; // Non moving only collides with moving
+          case Layers::MOVING:
+            return true; // Moving collides with everything
+          default:
+            JPH_ASSERT(false);
+            return false;
+          }
+        }
+      };
+
+      class BPLayerInterfaceImpl final : public JPH::BroadPhaseLayerInterface
+      {
+      public:
+        BPLayerInterfaceImpl()
+        {
+          // Create a mapping table from object to broad phase layer
+          mObjectToBroadPhase[Layers::NON_MOVING] = BroadPhaseLayers::NON_MOVING;
+          mObjectToBroadPhase[Layers::MOVING] = BroadPhaseLayers::MOVING;
+        }
+
+        JPH::uint GetNumBroadPhaseLayers() const override
+        {
+          return BroadPhaseLayers::NUM_LAYERS;
+        }
+
+        JPH::BroadPhaseLayer GetBroadPhaseLayer(JPH::ObjectLayer inLayer) const override
+        {
+          JPH_ASSERT(inLayer < Layers::NUM_LAYERS);
+          return mObjectToBroadPhase[inLayer];
+        }
+
+#if defined(JPH_EXTERNAL_PROFILE) || defined(JPH_PROFILE_ENABLED)
+        const char* GetBroadPhaseLayerName(BroadPhaseLayer inLayer) const override
+        {
+          switch ((BroadPhaseLayer::Type)inLayer)
+          {
+          case (BroadPhaseLayer::Type)BroadPhaseLayers::NON_MOVING:	return "NON_MOVING";
+          case (BroadPhaseLayer::Type)BroadPhaseLayers::MOVING:		return "MOVING";
+          default: JPH_ASSERT(false); return "INVALID";
+          }
+        }
+#endif // JPH_EXTERNAL_PROFILE || JPH_PROFILE_ENABLED
+
+      private:
+        JPH::BroadPhaseLayer mObjectToBroadPhase[Layers::NUM_LAYERS];
+      };
+
+      class ObjectVsBroadPhaseLayerFilterImpl : public JPH::ObjectVsBroadPhaseLayerFilter
+      {
+      public:
+        bool ShouldCollide(JPH::ObjectLayer inLayer1, JPH::BroadPhaseLayer inLayer2) const override
+        {
+          switch (inLayer1)
+          {
+          case Layers::NON_MOVING:
+            return inLayer2 == BroadPhaseLayers::MOVING;
+          case Layers::MOVING:
+            return true;
+          default:
+            JPH_ASSERT(false);
+            return false;
+          }
+        }
+      };
+    }
+
+    struct HashBodyID
+    {
+      std::size_t operator()(const JPH::BodyID& body) const noexcept
+      {
+        return std::hash<JPH::uint32>{}(body.GetIndexAndSequenceNumber());
+      }
+    };
+
+    JPH::TempAllocatorImpl* tempAllocator{}; 
+    JPH::JobSystemThreadPool* jobSystem{};
+    auto broad_phase_layer_interface = BPLayerInterfaceImpl();
+    auto object_vs_broadphase_layer_filter = ObjectVsBroadPhaseLayerFilterImpl();
+    auto object_vs_object_layer_filter = ObjectLayerPairFilterImpl();
+    auto engine = JPH::PhysicsSystem();
+    JPH::BodyInterface* body_interface{};
+    std::unordered_map<JPH::BodyID, entt::entity, HashBodyID> bodyToEntity;
   }
 
   namespace Game
@@ -158,6 +286,19 @@ void main()
       {
         Render::Mesh* mesh{};
       };
+
+      struct PhysicsKinematic
+      {
+        JPH::BodyID body;
+      };
+
+      struct PhysicsDynamic
+      {
+        JPH::BodyID body;
+      };
+
+      struct PhysicsKinematicAdded {};
+      struct PhysicsDynamicAdded {};
     }
 
     struct View
@@ -341,7 +482,7 @@ namespace
   {
     if (glfwInit() != GLFW_TRUE)
     {
-      throw std::exception("Failed to initialize GLFW");
+      throw std::runtime_error("Failed to initialize GLFW");
     }
 
     glfwSetErrorCallback([](int, const char* msg) { printf("GLFW error: %s\n", msg); });
@@ -418,6 +559,84 @@ namespace
 // Graphics
 namespace
 {
+  Render::Mesh LoadObjFile(const std::filesystem::path& path)
+  {
+    tinyobj::ObjReader reader;
+    if (!reader.ParseFromFile(path.string()))
+    {
+      std::cout << "TinyObjReader error: " << reader.Error() << '\n';
+      throw std::runtime_error("Failed to parse obj");
+    }
+
+    if (!reader.Warning().empty())
+    {
+      std::cout << "TinyObjReader warning: " << reader.Warning() << '\n';
+    }
+
+    auto& attrib = reader.GetAttrib();
+    auto& shapes = reader.GetShapes();
+    //auto& materials = reader.GetMaterials();
+
+    auto vertices = std::vector<Render::Vertex>();
+
+    // Loop over shapes
+    for (const auto& shape : shapes)
+    {
+      // Loop over faces(polygon)
+      size_t index_offset = 0;
+      for (const auto& fv : shape.mesh.num_face_vertices)
+      {
+        // Loop over vertices in the face.
+        for (size_t v = 0; v < fv; v++)
+        {
+          auto vertex = Render::Vertex{};
+
+          // access to vertex
+          tinyobj::index_t idx = shape.mesh.indices[index_offset + v];
+          tinyobj::real_t vx = attrib.vertices[3 * size_t(idx.vertex_index) + 0];
+          tinyobj::real_t vy = attrib.vertices[3 * size_t(idx.vertex_index) + 1];
+          tinyobj::real_t vz = attrib.vertices[3 * size_t(idx.vertex_index) + 2];
+
+          vertex.position = { vx, vy, vz };
+
+          // Check if `normal_index` is zero or positive. negative = no normal data
+          if (idx.normal_index >= 0)
+          {
+            tinyobj::real_t nx = attrib.normals[3 * size_t(idx.normal_index) + 0];
+            tinyobj::real_t ny = attrib.normals[3 * size_t(idx.normal_index) + 1];
+            tinyobj::real_t nz = attrib.normals[3 * size_t(idx.normal_index) + 2];
+            vertex.normal = { nx, ny, nz };
+          }
+
+          // Check if `texcoord_index` is zero or positive. negative = no texcoord data
+          if (idx.texcoord_index >= 0)
+          {
+            tinyobj::real_t tx = attrib.texcoords[2 * size_t(idx.texcoord_index) + 0];
+            tinyobj::real_t ty = attrib.texcoords[2 * size_t(idx.texcoord_index) + 1];
+            vertex.texcoord = { tx, ty };
+          }
+
+          // Optional: vertex colors
+          // tinyobj::real_t red   = attrib.colors[3*size_t(idx.vertex_index)+0];
+          // tinyobj::real_t green = attrib.colors[3*size_t(idx.vertex_index)+1];
+          // tinyobj::real_t blue  = attrib.colors[3*size_t(idx.vertex_index)+2];
+
+          vertices.push_back(vertex);
+        }
+        index_offset += fv;
+      }
+    }
+
+    auto indices = std::vector<Render::index_t>(vertices.size());
+    std::iota(indices.begin(), indices.end(), 0);
+
+    auto mesh = Render::Mesh{};
+    mesh.indexCount = (uint32_t)indices.size();
+    mesh.indexBuffer.emplace(indices);
+    mesh.vertexBuffer.emplace(vertices);
+    return mesh;
+  }
+
   void InitializeRenderer()
   {
     auto vertexShader = Fwog::Shader(Fwog::PipelineStage::VERTEX_SHADER, Render::sceneVertexSource);
@@ -524,6 +743,77 @@ namespace
   }
 }
 
+// Physics
+namespace
+{
+  void AddBodyKinematic(entt::entity e)
+  {
+    Game::registry.emplace<Game::ECS::PhysicsKinematicAdded>(e);
+  }
+
+  void AddBodyDynamic(entt::entity e)
+  {
+    Game::registry.emplace<Game::ECS::PhysicsDynamicAdded>(e);
+  }
+
+  void RemoveBodyKinematic(entt::entity e)
+  {
+    const auto& body = Game::registry.get<Game::ECS::PhysicsKinematic>(e).body;
+    Physics::body_interface->RemoveBody(body);
+    Physics::bodyToEntity.erase(body);
+  }
+
+  void RemoveBodyDynamic(entt::entity e)
+  {
+    const auto& body = Game::registry.get<Game::ECS::PhysicsDynamic>(e).body;
+    Physics::body_interface->RemoveBody(body);
+    Physics::bodyToEntity.erase(body);
+  }
+
+  void InitializePhysics()
+  {
+    Game::registry.on_construct<Game::ECS::PhysicsKinematic>().connect<AddBodyKinematic>();
+    Game::registry.on_construct<Game::ECS::PhysicsDynamic>().connect<AddBodyDynamic>();
+    Game::registry.on_destroy<Game::ECS::PhysicsKinematic>().connect<RemoveBodyKinematic>();
+    Game::registry.on_destroy<Game::ECS::PhysicsDynamic>().connect<RemoveBodyDynamic>();
+
+    JPH::RegisterDefaultAllocator();
+    //JPH::Trace =
+    //JPH_IF_ENABLE_ASSERTS(JPH::AssertFailed = )
+    JPH::Factory::sInstance = new JPH::Factory();
+    JPH::RegisterTypes();
+
+    Physics::tempAllocator = new JPH::TempAllocatorImpl(10 * 1024 * 1024);
+    Physics::jobSystem = new JPH::JobSystemThreadPool(JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers, std::thread::hardware_concurrency() - 1);
+    
+    constexpr JPH::uint cMaxBodies = 1024;
+    constexpr JPH::uint cNumBodyMutexes = 0;
+    constexpr JPH::uint cMaxBodyPairs = 1024;
+    constexpr JPH::uint cMaxContactConstraints = 1024;
+    Physics::engine.Init(cMaxBodies, cNumBodyMutexes, cMaxBodyPairs, cMaxContactConstraints, Physics::broad_phase_layer_interface, Physics::object_vs_broadphase_layer_filter, Physics::object_vs_object_layer_filter);
+
+    Physics::body_interface = &Physics::engine.GetBodyInterface();
+    
+    // Add static floor
+    auto floor_shape_settings = JPH::BoxShapeSettings(JPH::Vec3(100, 1, 100));
+    floor_shape_settings.SetEmbedded();
+    auto floor_shape_result = floor_shape_settings.Create();
+    auto floor_shape = floor_shape_result.Get();
+    auto floor_settings = JPH::BodyCreationSettings(floor_shape, JPH::RVec3(0.0_r, -1.0_r, 0.0_r), JPH::Quat::sIdentity(), JPH::EMotionType::Static, Physics::Layers::NON_MOVING);
+    auto* floor = Physics::body_interface->CreateBody(floor_settings); // Note that if we run out of bodies this can return nullptr
+    floor->SetRestitution(.5f);
+    Physics::body_interface->AddBody(floor->GetID(), JPH::EActivation::DontActivate);
+
+    Physics::engine.OptimizeBroadPhase();
+  }
+
+  void TerminatePhysics()
+  {
+    JPH::UnregisterTypes();
+    delete JPH::Factory::sInstance;
+  }
+}
+
 // Game
 namespace
 {
@@ -535,18 +825,33 @@ namespace
 
     transform.position = { 0, 0, -1 };
 
+    Game::testMesh = LoadObjFile(GetDataDirectory() / "models/bunny.obj");
+
+    //Render::Vertex vertices[] = {
+    //  Render::Vertex{{0, 0, 0}},
+    //  Render::Vertex{{1, -1, 0}},
+    //  Render::Vertex{{1, 1, 0}},
+    //};
+    //uint32_t indices[] = { 0, 1, 2 };
+
+    //Game::testMesh.vertexBuffer.emplace(std::span<const Render::Vertex>(vertices));
+    //Game::testMesh.indexBuffer.emplace(std::span<const uint32_t>(indices));
+    //Game::testMesh.indexCount = std::size(indices);
+
     Game::registry.emplace<Game::ECS::MeshRef>(Game::testEntity).mesh = &Game::testMesh;
 
-    Render::Vertex vertices[] = {
-      Render::Vertex{{0, 0, 0}},
-      Render::Vertex{{1, -1, 0}},
-      Render::Vertex{{1, 1, 0}},
-    };
-    uint32_t indices[] = { 0, 1, 2 };
+    // Add moving sphere
+    auto sphere_settings = JPH::BodyCreationSettings(new JPH::SphereShape(0.5f), JPH::RVec3(0.0_r, 3.0_r, 0.0_r), JPH::Quat::sIdentity(), JPH::EMotionType::Dynamic, Physics::Layers::MOVING);
+    auto* sphere_ptr = Physics::body_interface->CreateBody(sphere_settings);
+    auto sphere_id = sphere_ptr->GetID();
 
-    Game::testMesh.vertexBuffer.emplace(std::span<const Render::Vertex>(vertices));
-    Game::testMesh.indexBuffer.emplace(std::span<const uint32_t>(indices));
-    Game::testMesh.indexCount = std::size(indices);
+    Physics::body_interface->SetRestitution(sphere_id, .8f);
+
+    Game::ECS::PhysicsDynamic asdf;
+    asdf.body = sphere_id;
+    Game::registry.emplace<Game::ECS::PhysicsDynamic>(Game::testEntity, asdf);
+
+    Physics::engine.OptimizeBroadPhase();
   }
 
   void TerminateGame()
@@ -555,9 +860,45 @@ namespace
     Game::testMesh.indexBuffer.reset();
   }
 
-  void TickGameFixed([[maybe_unused]] double dt)
+  void TickGameFixed(double dt)
   {
+    for (auto [entity] : Game::registry.view<Game::ECS::PhysicsKinematicAdded>().each())
+    {
+      const auto& body = Game::registry.get<Game::ECS::PhysicsKinematic>(entity).body;
+      Physics::body_interface->AddBody(body, JPH::EActivation::DontActivate);
+      Physics::bodyToEntity.emplace(body, entity);
+      Game::registry.remove<Game::ECS::PhysicsKinematicAdded>(entity);
+    }
+    
+    for (auto [entity] : Game::registry.view<Game::ECS::PhysicsDynamicAdded>().each())
+    {
+      const auto& body = Game::registry.get<Game::ECS::PhysicsDynamic>(entity).body;
+      Physics::body_interface->AddBody(body, JPH::EActivation::Activate);
+      Physics::bodyToEntity.emplace(body, entity);
+      Game::registry.remove<Game::ECS::PhysicsDynamicAdded>(entity);
+    }
+    
+    Physics::engine.Update(float(dt), 1, Physics::tempAllocator, Physics::jobSystem);
 
+    auto bodies = JPH::BodyIDVector();
+    Physics::engine.GetActiveBodies(JPH::EBodyType::RigidBody, bodies);
+
+    for (const auto& body : bodies)
+    {
+      if (auto it = Physics::bodyToEntity.find(body); it != Physics::bodyToEntity.end())
+      {
+        auto entity = it->second;
+
+        if (auto* transform = Game::registry.try_get<Game::ECS::Transform>(entity))
+        {
+          auto pos = JPH::RVec3();
+          auto rot = JPH::Quat();
+          Physics::body_interface->GetPositionAndRotation(body, pos, rot);
+          transform->position = { pos.GetX(), pos.GetY(), pos.GetZ() };
+          transform->rotation = { rot.GetW(), rot.GetX(), rot.GetY(), rot.GetZ() };
+        }
+      }
+    }
   }
 
   void TickGameVariable([[maybe_unused]] double dt)
@@ -615,9 +956,11 @@ int main()
 {
   InitializeApplication();
   InitializeRenderer();
+  InitializePhysics();
   InitializeGame();
   MainLoop();
   TerminateGame();
+  TerminatePhysics();
   TerminateRenderer();
   TerminateApplication();
 }

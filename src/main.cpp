@@ -42,12 +42,42 @@
 #include <exception>
 #include <thread>
 #include <unordered_map>
+#include <functional>
 
 using namespace JPH::literals;
 
 // Globals
 namespace
 {
+  namespace PCG
+  {
+    constexpr std::uint32_t Hash(std::uint32_t seed)
+    {
+      std::uint32_t state = seed * 747796405u + 2891336453u;
+      std::uint32_t word  = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+      return (word >> 22u) ^ word;
+    }
+
+    // Used to advance the PCG state.
+    constexpr std::uint32_t RandU32(std::uint32_t& rng_state)
+    {
+      std::uint32_t state = rng_state;
+      rng_state           = rng_state * 747796405u + 2891336453u;
+      std::uint32_t word  = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+      return (word >> 22u) ^ word;
+    }
+
+    // Advances the prng state and returns the corresponding random float.
+    constexpr float RandFloat(std::uint32_t& state, float min = 0, float max = 1)
+    {
+      state   = RandU32(state);
+      float f = float(state) * std::bit_cast<float>(0x2f800004u);
+      return f * (max - min) + min;
+    }
+
+    std::uint32_t state{};
+  } // namespace PCG
+
   namespace App
   {
     GLFWwindow* window{};
@@ -334,7 +364,7 @@ void main()
 
       struct PreviousModel
       {
-        glm::mat4 world_from_object = glm::identity<glm::mat4>();
+        glm::mat4 world_from_object = glm::translate(glm::mat4(1), glm::vec3(100000)); // Epic hack to prevent frame of flickering when spawning objects
       };
 
       struct MeshRef
@@ -396,8 +426,18 @@ void main()
       state     = s;
     }
 
+    struct DifficultyConfig
+    {
+      double timeBetweenDungDrops{};
+      double timeBetweenOppDrops{};
+      int numOppsPerDrop = 1;
+      int numDungPerDrop = 1;
+      float velocityFactor = 1;
+    };
+
     View mainCamera{};
-    float cursorSensitivity            = 0.0025f;
+    float cursorSensitivity            = 0.25f;
+    float fovyDeg                      = 60.0f;
     float playerAcceleration           = 12;
     float playerMaxSpeed               = 2.5f;
     float playerInitialJumpVelocity    = 3.5f;  // Vertical speed immediately after pressing jump
@@ -407,14 +447,41 @@ void main()
     float playerFriction               = 1.2f;
     int difficulty                     = 1;
     int maxDifficulty                  = 5; // Highest difficulty attained, play more to unlock more
-    double secondsSurvived             = 0;
+    int maxDifficultyPlayed            = maxDifficulty; // Difficulties above this show as green in the menu
+    double secondsSurvived             = 0; // Current run duration
     double timeSinceDied               = 0;
     int moneyCollected                 = 0;
+    entt::entity floorEntity           = entt::null;
+    bool playerHasCamoufroge           = false;
+    double timeSinceSpawnedOpps        = 0;
+    double timeSinceSpawnedDung        = 0;
+    int irsDonations                   = 0;
 
     constexpr glm::vec4 terrainDefaultColor = {.2, .5, .1, 0};
     constexpr glm::vec4 terrainFrockeyColor = {1, 1, 1, 0};
     float terrainDefaultFriction            = 0.2f;
     float terrainFrockeyFriction            = 0.0f;
+
+    struct ShopItem
+    {
+      bool owned       = false;
+      int cost         = 0;
+      const char* name = "sample text";
+      const char* tooltip{};
+      std::function<void(void)> onPurchase;
+      std::function<void(void)> onRefund;
+    };
+
+    // Shopping
+    namespace
+    {
+      struct ShopRow
+      {
+        std::vector<ShopItem> items;
+      };
+
+      std::vector<ShopRow> shop;
+    } // namespace
 
     // Game objects
     entt::registry registry;
@@ -423,6 +490,25 @@ void main()
     Render::Mesh sphereMesh;
     Render::Mesh frogMesh;
     Render::Mesh envMesh;
+
+    const char* deathMessages[] = {
+      "You got frogged!",
+      "You became a frog's meal!",
+      "You were food, not friend.",
+      "RIP bozo",
+      "Caught!",
+      "Froggylicious! (you were eaten)",
+      "...",
+      "You croaked.",
+      "You were toadally delicious.",
+      "RIF (rest in frog)",
+      "<ribbit>",
+      "You forgot to bring a croaking device.",
+      "You came to a ribbeting demise.",
+      "Frogs love hip-hop... and you.",
+    };
+
+    int deathMessageIndex = 0;
   }
 }
 
@@ -599,7 +685,7 @@ namespace
     }
     const GLFWvidmode* videoMode = glfwGetVideoMode(monitor);
     // TODO: update app title
-    App::window = glfwCreateWindow(static_cast<int>(videoMode->width * .75), static_cast<int>(videoMode->height * .75), "MyMfFrogEngine", nullptr, nullptr);
+    App::window = glfwCreateWindow(static_cast<int>(videoMode->width * .75), static_cast<int>(videoMode->height * .75), "Afrocalypse", nullptr, nullptr);
     if (!App::window)
     {
       glfwTerminate();
@@ -638,6 +724,12 @@ namespace
     glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, nullptr, GL_TRUE);
 
     ImGui::CreateContext();
+    // TODO: proper GUI scaling
+    //float xscale, yscale;
+    //glfwGetWindowContentScale(App::window, &xscale, &yscale);
+    //const auto contentScale = std::max(xscale, yscale);
+    //const float fontSize    = glm::floor(18 * contentScale);
+    //ImGui::GetStyle().ScaleAllSizes(contentScale);
     ImGui_ImplGlfw_InitForOpenGL(App::window, true);
     ImGui_ImplOpenGL3_Init();
     ImGui::StyleColorsDark();
@@ -741,7 +833,7 @@ namespace
          .fragmentShader = &fragmentShader,
          .rasterizationState =
         {
-             .cullMode = Fwog::CullMode::NONE,
+             .cullMode = Fwog::CullMode::BACK,
         },
          .depthState =
         {
@@ -883,7 +975,7 @@ namespace
       },
       [&]
       {
-        auto projection = glm::perspective(glm::radians(60.0f), (float)App::windowSize.x / (float)App::windowSize.y, 0.1f, 200.0f);
+        auto projection = glm::perspective(glm::radians(Game::fovyDeg), (float)App::windowSize.x / (float)App::windowSize.y, 0.1f, 200.0f);
         Render::frameUniforms.clip_from_world = projection * Game::mainCamera.GetViewMatrix();
         Render::frameUniformsBuffer->UpdateData(Render::frameUniforms);
 
@@ -922,16 +1014,14 @@ namespace
     glfwSwapBuffers(App::window);
   }
 
+  void ShowShopInterface();
+  void BeginRound();
+
   void TickUI([[maybe_unused]] double dt)
   {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
-
-    //ImGui::Text("FPS: %.0f", 1 / dt);
-    //ImGui::Text("Camera pos: (%.1f, %.1f, %.1f)", Game::mainCamera.position.x, Game::mainCamera.position.y, Game::mainCamera.position.z);
-    //ImGui::Text("Camera dir: (%.1f, %.1f, %.1f)", Game::mainCamera.GetForwardDir().x, Game::mainCamera.GetForwardDir().y, Game::mainCamera.GetForwardDir().z);
-    //ImGui::Text("Camera euler: yaw: %.2f, pitch: %.2f", Game::mainCamera.yaw, Game::mainCamera.pitch);
 
     switch (Game::state)
     {
@@ -939,25 +1029,53 @@ namespace
     {
       glfwSetInputMode(App::window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
       ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-      ImGui::SetNextWindowSize(ImVec2(300, 120));
+      ImGui::SetNextWindowSize(ImVec2(370, 420));
       if (ImGui::Begin("common", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDecoration))
       {
         // Show difficulty selectors
+        ImGui::SeparatorText("Afrocalypse");
         ImGui::TextUnformatted("Select a difficulty to start");
         for (int i = 1; i <= 11; i++)
         {
-          ImGui::BeginDisabled(i > Game::maxDifficulty);
+          const auto disabled = i > Game::maxDifficulty;
+          const auto pushButtonColor = !disabled && i > Game::maxDifficultyPlayed;
+          ImGui::BeginDisabled(disabled);
+          if (pushButtonColor)
+          {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.5f, 0.3f, 1));
+          }
           if (ImGui::Button(std::to_string(i).c_str()))
           {
+            Game::maxDifficultyPlayed = glm::max(Game::maxDifficultyPlayed, i);
             Game::difficulty = i;
             Game::SetState(Game::State::GAME);
-            Game::secondsSurvived = 0;
+            BeginRound();
+          }
+          if (pushButtonColor)
+          {
+            ImGui::PopStyleColor();
           }
           ImGui::EndDisabled();
           if (i != 11)
           {
             ImGui::SameLine();
           }
+        }
+
+        // Show shop
+        ImGui::NewLine();
+        ShowShopInterface();
+        ImGui::NewLine();
+
+        // Options
+        ImGui::SeparatorText("Options");
+        ImGui::SliderFloat("Cursor speed", &Game::cursorSensitivity, 0, 2, "%.2f");
+        ImGui::SliderFloat("FoV", &Game::fovyDeg, 30, 90, "%.0f");
+        ImGui::NewLine();
+
+        if (ImGui::Button("Quit to desktop"))
+        {
+          glfwSetWindowShouldClose(App::window, GLFW_TRUE);
         }
       }
       ImGui::End();
@@ -966,11 +1084,59 @@ namespace
     case Game::State::GAME:
     {
       glfwSetInputMode(App::window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+      // TODO:: show money and time
+
+      ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.15f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+      ImGui::SetNextWindowSize(ImVec2(160, 90));
+      if (ImGui::Begin("common", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground))
+      {
+        ImGui::Text("Difficulty: %d", Game::difficulty);
+        ImGui::Text("Survived:   %.0f seconds", glm::floor(Game::secondsSurvived));
+        ImGui::Text("Currency:   %d D", Game::moneyCollected);
+      }
+      ImGui::End();
+      
       break;
     }
     case Game::State::PAUSE:
     {
       glfwSetInputMode(App::window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+
+      ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+      ImGui::SetNextWindowSize(ImVec2(160, 90));
+      if (ImGui::Begin("common", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDecoration))
+      {
+        if (ImGui::Button("Resume"))
+        {
+          Game::SetState(Game::State::GAME);
+        }
+        //ImGui::NewLine();
+        //// Options
+        //ImGui::SliderFloat("Cursor speed", &Game::cursorSensitivity, 0, 2, "%.2f");
+        //ImGui::SliderFloat("FoV", &Game::fovyDeg, 30, 90, "%.0f");
+        //ImGui::NewLine();
+
+        if (ImGui::Button("Exit to main menu"))
+        {
+          Game::SetState(Game::State::MAIN_MENU);
+        }
+        if (ImGui::Button("Quit to desktop"))
+        {
+          glfwSetWindowShouldClose(App::window, GLFW_TRUE);
+        }
+      }
+      ImGui::End();
+      break;
+    }
+    case Game::State::DIED:
+    {
+      ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+      ImGui::SetNextWindowSize(ImVec2(320, 50));
+      if (ImGui::Begin("common", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDecoration))
+      {
+        ImGui::TextUnformatted(Game::deathMessages[Game::deathMessageIndex]);
+      }
+      ImGui::End();
       break;
     }
     default:;
@@ -1070,6 +1236,7 @@ namespace
     auto* spherePtr = Physics::body_interface->CreateBody(sphereSettings);
     auto sphereID  = spherePtr->GetID();
     Physics::body_interface->SetRestitution(sphereID, .8f);
+    Physics::body_interface->AddBody(sphereID, JPH::EActivation::Activate);
     Physics::body_interface->SetLinearVelocity(sphereID, JPH::Vec3Arg(velocity.x, velocity.y, velocity.z));
 
     auto entity = Game::registry.create();
@@ -1092,6 +1259,7 @@ namespace
     auto* spherePtr = Physics::body_interface->CreateBody(sphereSettings);
     auto sphereID  = spherePtr->GetID();
     Physics::body_interface->SetRestitution(sphereID, .2f);
+    Physics::body_interface->AddBody(sphereID, JPH::EActivation::Activate);
     Physics::body_interface->SetLinearVelocity(sphereID, JPH::Vec3Arg(velocity.x, velocity.y, velocity.z));
 
     auto entity = Game::registry.create();
@@ -1108,9 +1276,218 @@ namespace
     return entity;
   }
 
+  void BeginRound()
+  {
+    Game::mainCamera.position = {0, 2, 0};
+    Physics::character->SetPosition(JPH::Vec3Arg(0, 2, 0));
+    Game::secondsSurvived = 0;
+    Game::timeSinceDied   = 0;
+    Game::timeSinceSpawnedOpps = -2; // Give the player a moment before the afrocalypse starts
+    Game::timeSinceSpawnedDung = 0;
+
+    auto frogs = Game::registry.view<Game::ECS::Frog>();
+    Game::registry.destroy(frogs.begin(), frogs.end());
+
+    auto dung = Game::registry.view<Game::ECS::Dung>();
+    Game::registry.destroy(dung.begin(), dung.end());
+  }
+
+  Game::DifficultyConfig GetDifficultyConfig([[maybe_unused]] int difficulty)
+  {
+    // Config for difficulty 1
+    Game::DifficultyConfig config{
+      .timeBetweenDungDrops = 1.2f - 0.1f * (difficulty - 1),
+      .timeBetweenOppDrops  = 2.5f - 0.2f * (difficulty -1),
+      .numOppsPerDrop = 1,
+      .numDungPerDrop = 1,
+      .velocityFactor       = 0.8f + 0.04f * (difficulty - 1),
+    };
+
+    if (difficulty >= 6)
+    {
+      config.numDungPerDrop++;
+      config.numOppsPerDrop++;
+    }
+
+    if (difficulty >= 10)
+    {
+      config.numDungPerDrop++;
+      config.numOppsPerDrop++;
+    }
+
+    if (difficulty >= 11)
+    {
+      config.numDungPerDrop++;
+      config.numOppsPerDrop++;
+    }
+
+    return config;
+  }
+
+  void PopulateShop()
+  {
+    Game::ShopRow speedRow;
+    for (int i = 0; i < 5; i++)
+    {
+      speedRow.items.push_back(Game::ShopItem{
+        .cost       = 5 + 10 * i,
+        .name       = "Budgett's walking stick",
+        .tooltip    = "Increase max speed by 20%",
+        .onPurchase = [] { Game::playerMaxSpeed *= 1.2f; },
+        .onRefund   = [] { Game::playerMaxSpeed /= 1.2f; },
+      });
+    }
+    Game::shop.push_back(speedRow);
+
+    Game::ShopRow accelRow;
+    for (int i = 0; i < 5; i++)
+    {
+      accelRow.items.push_back(Game::ShopItem{
+        .cost       = 4 + 4 * i,
+        .name       = "Wednesday siren",
+        .tooltip    = "Increase acceleration by 30%",
+        .onPurchase = [] { Game::playerAcceleration *= 1.3f; },
+        .onRefund   = [] { Game::playerAcceleration /= 1.3f; },
+      });
+    }
+    Game::shop.push_back(accelRow);
+
+    Game::ShopRow jumpRow;
+    for (int i = 0; i < 5; i++)
+    {
+      jumpRow.items.push_back(Game::ShopItem{
+        .cost       = 10 + 5 * i,
+        .name       = "Surgically grafted frog legs",
+        .tooltip    = "Increase base jump velocity by 10%",
+        .onPurchase = [] { Game::playerInitialJumpVelocity *= 1.1f; },
+        .onRefund   = [] { Game::playerInitialJumpVelocity /= 1.1f; },
+      });
+    }
+    Game::shop.push_back(jumpRow);
+
+    Game::ShopRow camoRow;
+    camoRow.items.push_back(Game::ShopItem{
+      .cost = 50,
+      .name = "Camoufroge",
+      .tooltip = "Gives you a 50% chance to not be eaten when frogged",
+      .onPurchase =
+        []
+      {
+        Game::playerHasCamoufroge = true;
+      },
+      .onRefund =
+        []
+      {
+        Game::playerHasCamoufroge = false;
+      },
+    });
+    Game::shop.push_back(camoRow);
+
+    Game::ShopRow frockeyRow;
+    frockeyRow.items.push_back(Game::ShopItem{
+      .cost    = -25,
+      .name    = "Frockey",
+      .tooltip = ":)",
+      .onPurchase =
+        []
+      {
+        Game::registry.get<Game::ECS::Tint>(Game::floorEntity).color = Game::terrainFrockeyColor;
+        Physics::body_interface->SetFriction(Game::registry.get<Game::ECS::PhysicsKinematic>(Game::floorEntity).body, Game::terrainFrockeyFriction);
+      },
+      .onRefund =
+        []
+      {
+        Game::registry.get<Game::ECS::Tint>(Game::floorEntity).color = Game::terrainDefaultColor;
+        Physics::body_interface->SetFriction(Game::registry.get<Game::ECS::PhysicsKinematic>(Game::floorEntity).body, Game::terrainDefaultFriction);
+      },
+    });
+    Game::shop.push_back(frockeyRow);
+  }
+
+  void ShowShopInterface()
+  {
+    ImGui::SeparatorText("Bugge Shoppe");
+    ImGui::Text("Currency: %d D", Game::moneyCollected);
+    if (ImGui::Button("Refund all"))
+    {
+      for (auto& row : Game::shop)
+      {
+        for (auto& item : row.items)
+        {
+          if (item.owned)
+          {
+            item.onRefund();
+            Game::moneyCollected += item.cost;
+            item.owned = false;
+          }
+        }
+      }
+    }
+    for (auto j = 0; auto& row : Game::shop)
+    {
+      ImGui::PushID(j++);
+      bool prevItemIsntOwned = false;
+      for (size_t i = 0; i < row.items.size(); i++)
+      {
+        auto& item = row.items[i];
+
+        // Only show name for first item in a row
+        if (i == 0)
+        {
+          ImGui::TextUnformatted(item.name);
+          if (item.tooltip)
+          {
+            ImGui::SetItemTooltip("%s", item.tooltip);
+          }
+          ImGui::SameLine();
+        }
+
+        ImGui::PushID((int)i);
+        
+        ImGui::BeginDisabled(prevItemIsntOwned || Game::moneyCollected < item.cost || item.owned);
+        const bool itemOwned = item.owned;
+        if (itemOwned)
+        {
+          ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 1));
+        }
+        if (ImGui::Button(std::to_string(item.cost).c_str()))
+        {
+          item.onPurchase();
+          Game::moneyCollected -= item.cost;
+          item.owned = true;
+        }
+        if (itemOwned)
+        {
+          ImGui::PopStyleColor();
+        }
+        ImGui::EndDisabled();
+
+        ImGui::PopID();
+
+
+        if (i != row.items.size() - 1)
+        {
+          ImGui::SameLine();
+        }
+
+        prevItemIsntOwned = !item.owned;
+      }
+      ImGui::PopID();
+    }
+    ImGui::TextUnformatted("IRS donation");
+    ImGui::SameLine();
+    if (ImGui::Button("10##asdf"))
+    {
+      Game::moneyCollected -= 10;
+      Game::irsDonations++;
+    }
+  }
+
   void InitializeGame()
   {
-    Game::mainCamera.position = {5, 3, 0};
+    PCG::state = PCG::Hash((uint32_t)std::time(nullptr));
+
+    PopulateShop();
     Game::cubeMesh            = LoadObjFile(GetDataDirectory() / "models/cube.obj");
     Game::sphereMesh          = LoadObjFile(GetDataDirectory() / "models/sphere.obj");
     Game::frogMesh            = LoadObjFile(GetDataDirectory() / "models/frog.obj");
@@ -1123,24 +1500,12 @@ namespace
     floor->SetRestitution(.0f);
     floor->SetFriction(Game::terrainDefaultFriction);
 
-    auto floorEntity                                                      = Game::registry.create();
-    Game::registry.emplace<Game::ECS::Transform>(floorEntity).scale       = {1, 1, 1};
-    Game::registry.emplace<Game::ECS::MeshRef>(floorEntity).mesh          = &Game::envMesh;
-    Game::registry.emplace<Game::ECS::Floor>(floorEntity);
-    Game::registry.emplace<Game::ECS::PhysicsKinematic>(floorEntity).body = floor->GetID();
-    Game::registry.emplace<Game::ECS::Tint>(floorEntity).color            = Game::terrainDefaultColor;
-
-    for (int i = 0; i < 5; i++)
-    {
-      for (int j = 0; j < 8; j++)
-      {
-        for (int k = 0; k < 8; k++)
-        {
-          //SpawnRegularFrog({(float)k, 10 * i + 5, (float)j});
-          SpawnDung({(float)k, 10 * i + 5, (float)j});
-        }
-      }
-    }
+    Game::floorEntity                                                     = Game::registry.create();
+    Game::registry.emplace<Game::ECS::Transform>(Game::floorEntity).scale = {1, 1, 1};
+    Game::registry.emplace<Game::ECS::MeshRef>(Game::floorEntity).mesh    = &Game::envMesh;
+    Game::registry.emplace<Game::ECS::Floor>(Game::floorEntity);
+    Game::registry.emplace<Game::ECS::PhysicsKinematic>(Game::floorEntity).body = floor->GetID();
+    Game::registry.emplace<Game::ECS::Tint>(Game::floorEntity).color            = Game::terrainDefaultColor;
 
     // Add player character
     auto characterSettings = JPH::CharacterSettings();
@@ -1163,7 +1528,7 @@ namespace
         [[maybe_unused]] JPH::ContactSettings& ioSettings) override
       {
         auto ee1 = Physics::bodyToEntity.find(inBody1.GetID());
-        auto ee2 = Physics::bodyToEntity.find(inBody1.GetID());
+        auto ee2 = Physics::bodyToEntity.find(inBody2.GetID());
 
         entt::entity e1 = ee1 != Physics::bodyToEntity.end() ? ee1->second : entt::null;
         entt::entity e2 = ee2 != Physics::bodyToEntity.end() ? ee2->second : entt::null;
@@ -1196,8 +1561,12 @@ namespace
         {
           if (frog != entt::null)
           {
-            // TODO: play death sound
-            //Game::SetState(Game::State::DIED);
+            if ((!Game::playerHasCamoufroge || PCG::RandU32(PCG::state) % 2 == 0) && Game::timeSinceDied <= 0)
+            {
+              // TODO: play death sound
+              Game::SetState(Game::State::DIED);
+              Game::deathMessageIndex = PCG::RandU32(PCG::state) % std::size(Game::deathMessages);
+            }
           }
 
           if (dung != entt::null)
@@ -1248,10 +1617,54 @@ namespace
         Game::SetState(Game::State::MAIN_MENU);
       }
     }
+    
+    auto deleted = Game::registry.view<Game::ECS::DeferDelete>();
+    Game::registry.destroy(deleted.begin(), deleted.end());
 
-    for (auto [entity] : Game::registry.view<Game::ECS::DeferDelete>().each())
+    // Fling frogs and dung randomly from around the map
+    Game::timeSinceSpawnedDung += dt;
+    Game::timeSinceSpawnedOpps += dt;
+    auto config = GetDifficultyConfig(Game::difficulty);
+    if (Game::timeSinceSpawnedDung > config.timeBetweenDungDrops)
     {
-      Game::registry.destroy(entity);
+      Game::timeSinceSpawnedDung -= config.timeBetweenDungDrops;
+      for (int i = 0; i < config.numDungPerDrop; i++)
+      {
+        const auto phi = PCG::RandFloat(PCG::state, 0, glm::two_pi<float>());
+        const float r  = 30;
+        const auto pos = glm::vec3(glm::cos(phi) * r, 6, glm::sin(phi) * r);
+        const auto vel = 20.0f * glm::normalize(glm::vec3(0, 15 + PCG::RandFloat(PCG::state) * 10, 0) - pos); // Shoot at origin
+        SpawnDung(pos, vel * config.velocityFactor);
+      }
+    }
+
+    if (Game::timeSinceSpawnedOpps > config.timeBetweenOppDrops)
+    {
+      Game::timeSinceSpawnedOpps -= config.timeBetweenOppDrops;
+      for (int i = 0; i < config.numOppsPerDrop; i++)
+      {
+        const auto phi = PCG::RandFloat(PCG::state, 0, glm::two_pi<float>());
+        const float r  = 30;
+        const auto pos = glm::vec3(glm::cos(phi) * r, 6, glm::sin(phi) * r);
+        const auto vel = 20.0f * glm::normalize(glm::vec3(0, 15 + PCG::RandFloat(PCG::state) * 10, 0) - pos); // Shoot at origin
+        SpawnRegularFrog(pos, vel * config.velocityFactor);
+      }
+    }
+
+    for (auto [entity, transform] : Game::registry.view<Game::ECS::Frog, Game::ECS::Transform>().each())
+    {
+      if (transform.position.y < -100)
+      {
+        Game::registry.destroy(entity);
+      }
+    }
+
+    for (auto [entity, transform] : Game::registry.view<Game::ECS::Dung, Game::ECS::Transform>().each())
+    {
+      if (transform.position.y < -100)
+      {
+        Game::registry.destroy(entity);
+      }
     }
 
     for (auto [entity] : Game::registry.view<Game::ECS::PhysicsKinematicAdded>().each())
@@ -1264,8 +1677,8 @@ namespace
     
     for (auto [entity] : Game::registry.view<Game::ECS::PhysicsDynamicAdded>().each())
     {
+      // HACK: don't add body to system here since we want to set linear velocity upon creation
       const auto& body = Game::registry.get<Game::ECS::PhysicsDynamic>(entity).body;
-      Physics::body_interface->AddBody(body, JPH::EActivation::Activate);
       Physics::bodyToEntity.emplace(body, entity);
       Game::registry.remove<Game::ECS::PhysicsDynamicAdded>(entity);
     }
@@ -1297,9 +1710,41 @@ namespace
 
   void TickGameVariable([[maybe_unused]] double dt, float interpolant)
   {
+    // CHEAT: unlock next difficulty
+    if (ImGui::GetKeyPressedAmount(ImGuiKey_F5, 100000, 1))
+    {
+      Game::maxDifficulty++;
+    }
+
+    // CHEAT: give player a bunch of money
+    if (ImGui::GetKeyPressedAmount(ImGuiKey_F6, 100000, 1))
+    {
+      Game::moneyCollected += 100;
+    }
+
+    bool justUnpaused = false;
+    if (Game::state == Game::State::PAUSE && ImGui::GetKeyPressedAmount(ImGuiKey_Escape, 100000, 1))
+    {
+      Game::SetState(Game::State::GAME);
+      justUnpaused = true;
+    }
+
     if (Game::state != Game::State::GAME)
     {
       return;
+    }
+
+    Game::secondsSurvived += dt;
+
+    // Unlock new difficulty
+    if (Game::secondsSurvived > 30 && Game::difficulty == Game::maxDifficulty)
+    {
+      Game::maxDifficulty++;
+    }
+
+    if (!justUnpaused && ImGui::GetKeyPressedAmount(ImGuiKey_Escape, 100000, 1))
+    {
+      Game::SetState(Game::State::PAUSE);
     }
 
     static float lastInterpolant = interpolant;
@@ -1322,6 +1767,11 @@ namespace
     {
       impulse = impulse / impulseLen * Game::playerAcceleration;
     }
+    auto vel  = Physics::character->GetLinearVelocity();
+    // Additionally clamp input velocity so it doesn't increase the horizontal speed beyond the max (instead of clamping final velocity)
+    //auto velg = glm::vec3(vel.GetX(), vel.GetY(), vel.GetZ());
+    //auto avail = glm::clamp(Game::playerMaxSpeed - glm::length(velg + impulse), 0.0f, 1.0f);
+    //impulse *= avail;
     Physics::character->AddLinearVelocity(JPH::Vec3Arg(impulse.x, impulse.y, impulse.z));
 
     if (Physics::character->GetGroundState() == JPH::CharacterBase::EGroundState::OnGround)
@@ -1338,7 +1788,7 @@ namespace
     {
       if (Physics::character->GetGroundState() == JPH::CharacterBase::EGroundState::OnGround)
       {
-        auto vel = Physics::character->GetLinearVelocity();
+        //auto vel = Physics::character->GetLinearVelocity();
         vel.SetY(Game::playerInitialJumpVelocity); // Remove possible downwards velocity
         Physics::character->SetLinearVelocity(vel);
         auto pos = Physics::character->GetPosition();
@@ -1349,8 +1799,8 @@ namespace
 
       Physics::character->AddLinearVelocity(JPH::Vec3Arg(0, Game::playerJumpAcceleration * dtf, 0));
     }
-    Game::mainCamera.yaw += static_cast<float>(App::cursorOffset.x * Game::cursorSensitivity);
-    Game::mainCamera.pitch += static_cast<float>(App::cursorOffset.y * Game::cursorSensitivity);
+    Game::mainCamera.yaw += static_cast<float>(App::cursorOffset.x * Game::cursorSensitivity / 100.0f);
+    Game::mainCamera.pitch += static_cast<float>(App::cursorOffset.y * Game::cursorSensitivity / 100.0f);
     Game::mainCamera.pitch = glm::clamp(Game::mainCamera.pitch, -glm::half_pi<float>() + 1e-4f, glm::half_pi<float>() - 1e-4f);
 
     static glm::vec3 oldCameraPos = Game::mainCamera.position;
@@ -1365,7 +1815,6 @@ namespace
     }
 
     // Clamp horizontal speed
-    auto vel = Physics::character->GetLinearVelocity();
     if (auto speed = glm::length(glm::vec2(vel.GetX(), vel.GetZ())); speed > Game::playerMaxSpeed)
     {
       vel.SetX(vel.GetX() / speed * Game::playerMaxSpeed);

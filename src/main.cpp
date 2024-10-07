@@ -27,6 +27,7 @@
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
+#include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyActivationListener.h>
 #include <Jolt/Physics/Character/CharacterVirtual.h>
@@ -86,6 +87,8 @@ namespace
       glm::mat4 clip_from_world{};
       glm::mat4 light_from_world{};
       glm::vec3 sunDirection = glm::normalize(glm::vec3{.2f, -1.f, 0});
+      uint32_t padding{};
+      glm::vec3 camPosition{};
     };
 
     std::optional<Fwog::GraphicsPipeline> pipeline;
@@ -124,6 +127,7 @@ layout(binding = 1, std430) readonly buffer FrameUniforms
   mat4 clip_from_world;
   mat4 light_from_world;
   vec3 sunDirection;
+  vec3 camPosition;
 }frame;
 
 layout(binding = 2, std430) readonly buffer InstanceBuffer
@@ -134,7 +138,7 @@ layout(binding = 2, std430) readonly buffer InstanceBuffer
 layout(location = 0) out vec3 v_position;
 layout(location = 1) out vec3 v_normal;
 layout(location = 2) out vec3 v_color;
-layout(location = 3) out vec3 v_tint;
+layout(location = 3) out vec4 v_tint;
 
 void main()
 {
@@ -148,7 +152,7 @@ void main()
   v_position = (instance.world_from_object * vec4(posObj, 1.0)).xyz;
   v_normal   = transpose(inverse(mat3(instance.world_from_object))) * normObj;
   v_color    = vec3(v.cr, v.cg, v.cb);
-  v_tint     = instance.tintColor.rgb;
+  v_tint     = instance.tintColor;
 
   gl_Position = frame.clip_from_world * vec4(v_position, 1.0);
 }
@@ -162,6 +166,7 @@ layout(binding = 1, std430) readonly buffer FrameUniforms
   mat4 clip_from_world;
   mat4 light_from_world;
   vec3 sunDirection;
+  vec3 camPosition;
 }frame;
 
 layout(binding = 0) uniform sampler2DShadow s_shadowMap;
@@ -169,7 +174,7 @@ layout(binding = 0) uniform sampler2DShadow s_shadowMap;
 layout(location = 0) in vec3 v_position;
 layout(location = 1) in vec3 v_normal;
 layout(location = 2) in vec3 v_color;
-layout(location = 3) in vec3 v_tint;
+layout(location = 3) in vec4 v_tint;
 
 layout(location = 0) out vec4 o_color;
 
@@ -182,8 +187,18 @@ void main()
   const float shadow = textureLod(s_shadowMap, lightUv, 0);
   const float sunDiffuse = shadow * max(0, dot(v_normal, -frame.sunDirection));
 
-  const vec3 albedo = v_tint * mix(v_color, v_normal * .5 + .5, .1);
-  o_color = vec4(0.8 * sunDiffuse * albedo + 0.2 * albedo, 1.0);
+  vec3 specular = vec3(0);
+  if (v_tint.a > 1) // Hacky way to get phong-like specular
+  {
+    const vec3 surfaceToCam = normalize(frame.camPosition - v_position);
+    const vec3 reflected = normalize(reflect(frame.sunDirection, v_normal));
+    const float spec = pow(max(0, dot(reflected, surfaceToCam)), v_tint.a);
+    //specular = spec * v_tint.rgb;
+    specular = vec3(spec);
+  }
+
+  const vec3 albedo = v_tint.rgb * mix(v_color, v_normal * .5 + .5, .1);
+  o_color = vec4(specular + 0.8 * sunDiffuse * albedo + 0.2 * albedo, 1.0);
 }
 )";
     }
@@ -305,10 +320,10 @@ void main()
   {
     namespace ECS
     {
-      struct Name
-      {
-        std::string string;
-      };
+      struct Frog {};
+      struct Dung {};
+      struct Floor {};
+      struct DeferDelete{};
 
       struct Transform
       {
@@ -329,7 +344,7 @@ void main()
 
       struct Tint
       {
-        glm::vec3 color = {1, 1, 1};
+        glm::vec4 color = {1, 1, 1, 1};
       };
 
       struct PhysicsKinematic
@@ -364,25 +379,49 @@ void main()
       }
     };
 
+    enum class State
+    {
+      MAIN_MENU,
+      GAME,
+      PAUSE,
+      DIED,
+    };
+
+    State state     = State::MAIN_MENU;
+    State lastState = State::MAIN_MENU;
+
+    void SetState(State s)
+    {
+      lastState = state;
+      state     = s;
+    }
 
     View mainCamera{};
     float cursorSensitivity            = 0.0025f;
-    float playerAcceleration           = 10;
-    float playerMaxSpeed               = 2;
-    float playerInitialJumpVelocity    = 3.5;  // Vertical speed immediately after pressing jump
+    float playerAcceleration           = 12;
+    float playerMaxSpeed               = 2.5f;
+    float playerInitialJumpVelocity    = 3.5f;  // Vertical speed immediately after pressing jump
     float playerJumpAcceleration       = 10;   // Vertical acceleration when holding jump
     float playerTimeSinceOnGround      = 1000;
     float playerJumpModulationDuration = 0.2f; // Longer duration means more velocity can be added if the player holds jump
     float playerFriction               = 1.2f;
+    int difficulty                     = 1;
+    int maxDifficulty                  = 5; // Highest difficulty attained, play more to unlock more
+    double secondsSurvived             = 0;
+    double timeSinceDied               = 0;
+    int moneyCollected                 = 0;
 
-    constexpr glm::vec3 terrainDefaultColor = {.2, .5, .1};
-    constexpr glm::vec3 terrainFrockeyColor = {1, 1, 1};
+    constexpr glm::vec4 terrainDefaultColor = {.2, .5, .1, 0};
+    constexpr glm::vec4 terrainFrockeyColor = {1, 1, 1, 0};
+    float terrainDefaultFriction            = 0.2f;
+    float terrainFrockeyFriction            = 0.0f;
 
     // Game objects
     entt::registry registry;
-    Render::Mesh testMesh;
+
     Render::Mesh cubeMesh;
     Render::Mesh sphereMesh;
+    Render::Mesh frogMesh;
     Render::Mesh envMesh;
   }
 }
@@ -603,8 +642,7 @@ namespace
     ImGui_ImplOpenGL3_Init();
     ImGui::StyleColorsDark();
 
-    //glfwSetInputMode(App::window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-    glfwSetInputMode(App::window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    glfwSetInputMode(App::window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
   }
 
   void TerminateApplication()
@@ -782,12 +820,12 @@ namespace
         }
       }
 
-      auto tintColor = glm::vec3(1);
+      auto tintColor = glm::vec4(1);
       if (auto* p = Game::registry.try_get<Game::ECS::Tint>(entity))
       {
         tintColor = p->color;
       }
-      instanceData.emplace_back(renderModel, glm::vec4(tintColor, 1));
+      instanceData.emplace_back(renderModel, tintColor);
     }
 
     lastInterpolant = interpolant;
@@ -803,7 +841,8 @@ namespace
     }
 
     const auto lightView_from_world = glm::lookAt(glm::vec3(0), Render::frameUniforms.sunDirection, glm::vec3(0, 1, 0));
-    Render::frameUniforms.light_from_world = glm::ortho(-20.0f, 20.0f, -20.0f, 20.0f, -200.0f, 200.0f) * lightView_from_world;
+    Render::frameUniforms.light_from_world = glm::ortho(-30.0f, 30.0f, -30.0f, 30.0f, -200.0f, 200.0f) * lightView_from_world;
+    Render::frameUniforms.camPosition      = Game::mainCamera.position;
 
     Fwog::Render(
       Fwog::RenderInfo{
@@ -889,10 +928,53 @@ namespace
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
-    ImGui::Text("FPS: %.0f", 1 / dt);
-    ImGui::Text("Camera pos: (%.1f, %.1f, %.1f)", Game::mainCamera.position.x, Game::mainCamera.position.y, Game::mainCamera.position.z);
-    ImGui::Text("Camera dir: (%.1f, %.1f, %.1f)", Game::mainCamera.GetForwardDir().x, Game::mainCamera.GetForwardDir().y, Game::mainCamera.GetForwardDir().z);
-    ImGui::Text("Camera euler: yaw: %.2f, pitch: %.2f", Game::mainCamera.yaw, Game::mainCamera.pitch);
+    //ImGui::Text("FPS: %.0f", 1 / dt);
+    //ImGui::Text("Camera pos: (%.1f, %.1f, %.1f)", Game::mainCamera.position.x, Game::mainCamera.position.y, Game::mainCamera.position.z);
+    //ImGui::Text("Camera dir: (%.1f, %.1f, %.1f)", Game::mainCamera.GetForwardDir().x, Game::mainCamera.GetForwardDir().y, Game::mainCamera.GetForwardDir().z);
+    //ImGui::Text("Camera euler: yaw: %.2f, pitch: %.2f", Game::mainCamera.yaw, Game::mainCamera.pitch);
+
+    switch (Game::state)
+    {
+    case Game::State::MAIN_MENU:
+    {
+      glfwSetInputMode(App::window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+      ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+      ImGui::SetNextWindowSize(ImVec2(300, 120));
+      if (ImGui::Begin("common", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDecoration))
+      {
+        // Show difficulty selectors
+        ImGui::TextUnformatted("Select a difficulty to start");
+        for (int i = 1; i <= 11; i++)
+        {
+          ImGui::BeginDisabled(i > Game::maxDifficulty);
+          if (ImGui::Button(std::to_string(i).c_str()))
+          {
+            Game::difficulty = i;
+            Game::SetState(Game::State::GAME);
+            Game::secondsSurvived = 0;
+          }
+          ImGui::EndDisabled();
+          if (i != 11)
+          {
+            ImGui::SameLine();
+          }
+        }
+      }
+      ImGui::End();
+      break;
+    }
+    case Game::State::GAME:
+    {
+      glfwSetInputMode(App::window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+      break;
+    }
+    case Game::State::PAUSE:
+    {
+      glfwSetInputMode(App::window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+      break;
+    }
+    default:;
+    }
   }
 }
 
@@ -963,10 +1045,10 @@ namespace
     Physics::tempAllocator = new JPH::TempAllocatorImpl(10 * 1024 * 1024);
     Physics::jobSystem = new JPH::JobSystemThreadPool(JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers, std::thread::hardware_concurrency() - 1);
     
-    constexpr JPH::uint cMaxBodies = 2024;
+    constexpr JPH::uint cMaxBodies = 5000;
     constexpr JPH::uint cNumBodyMutexes = 0;
-    constexpr JPH::uint cMaxBodyPairs = 2024;
-    constexpr JPH::uint cMaxContactConstraints = 2024;
+    constexpr JPH::uint cMaxBodyPairs = 5000;
+    constexpr JPH::uint cMaxContactConstraints = 5000;
     Physics::engine.Init(cMaxBodies, cNumBodyMutexes, cMaxBodyPairs, cMaxContactConstraints, Physics::broad_phase_layer_interface, Physics::object_vs_broadphase_layer_filter, Physics::object_vs_object_layer_filter);
 
     Physics::body_interface = &Physics::engine.GetBodyInterface();
@@ -982,32 +1064,71 @@ namespace
 // Game
 namespace
 {
-  entt::entity SpawnRegularFrog()
+  entt::entity SpawnRegularFrog(glm::vec3 pos, glm::vec3 velocity = {})
   {
+    auto sphereSettings = JPH::BodyCreationSettings(new JPH::SphereShape(0.5f), JPH::RVec3(pos.x, pos.y, pos.z), JPH::Quat::sIdentity(), JPH::EMotionType::Dynamic, Physics::Layers::MOVING);
+    auto* spherePtr = Physics::body_interface->CreateBody(sphereSettings);
+    auto sphereID  = spherePtr->GetID();
+    Physics::body_interface->SetRestitution(sphereID, .8f);
+    Physics::body_interface->SetLinearVelocity(sphereID, JPH::Vec3Arg(velocity.x, velocity.y, velocity.z));
+
+    auto entity = Game::registry.create();
+    Game::registry.emplace<Game::ECS::Frog>(entity);
+    auto& transform = Game::registry.emplace<Game::ECS::Transform>(entity);
     
+    transform.scale = { 0.5f, 0.5f, 0.5f };
+
+    Game::registry.emplace<Game::ECS::MeshRef>(entity).mesh = &Game::frogMesh;
+    Game::registry.emplace<Game::ECS::PhysicsDynamic>(entity).body = sphereID;
+    Game::registry.emplace<Game::ECS::PreviousModel>(entity);
+    Game::registry.emplace<Game::ECS::Tint>(entity).color = {1, 1, 1, 1};
+
+    return entity;
+  }
+
+  entt::entity SpawnDung(glm::vec3 pos, glm::vec3 velocity = {})
+  {
+    auto sphereSettings = JPH::BodyCreationSettings(new JPH::SphereShape(0.3f), JPH::RVec3(pos.x, pos.y, pos.z), JPH::Quat::sIdentity(), JPH::EMotionType::Dynamic, Physics::Layers::MOVING);
+    auto* spherePtr = Physics::body_interface->CreateBody(sphereSettings);
+    auto sphereID  = spherePtr->GetID();
+    Physics::body_interface->SetRestitution(sphereID, .2f);
+    Physics::body_interface->SetLinearVelocity(sphereID, JPH::Vec3Arg(velocity.x, velocity.y, velocity.z));
+
+    auto entity = Game::registry.create();
+    Game::registry.emplace<Game::ECS::Dung>(entity);
+    auto& transform = Game::registry.emplace<Game::ECS::Transform>(entity);
+    
+    transform.scale = { 0.3f, 0.3f, 0.3f };
+
+    Game::registry.emplace<Game::ECS::MeshRef>(entity).mesh = &Game::sphereMesh;
+    Game::registry.emplace<Game::ECS::PhysicsDynamic>(entity).body = sphereID;
+    Game::registry.emplace<Game::ECS::PreviousModel>(entity);
+    Game::registry.emplace<Game::ECS::Tint>(entity).color = {0.844f, 0.676f, 0.273f, 15};
+
+    return entity;
   }
 
   void InitializeGame()
   {
     Game::mainCamera.position = {5, 3, 0};
-    Game::testMesh            = LoadObjFile(GetDataDirectory() / "models/bunny.obj");
     Game::cubeMesh            = LoadObjFile(GetDataDirectory() / "models/cube.obj");
-    Game::sphereMesh          = LoadObjFile(GetDataDirectory() / "models/frog.obj");
+    Game::sphereMesh          = LoadObjFile(GetDataDirectory() / "models/sphere.obj");
+    Game::frogMesh            = LoadObjFile(GetDataDirectory() / "models/frog.obj");
     Game::envMesh             = LoadObjFile(GetDataDirectory() / "models/ground.obj");
 
     // Add static floor
     auto floorShape = CreateMeshShape(Game::envMesh);
-    auto floor_settings = JPH::BodyCreationSettings(floorShape, JPH::RVec3(0.0_r, -1.0_r, 0.0_r), JPH::Quat::sIdentity(), JPH::EMotionType::Static, Physics::Layers::NON_MOVING);
-    auto* floor = Physics::body_interface->CreateBody(floor_settings); // Note that if we run out of bodies this can return nullptr
+    auto floor_settings = JPH::BodyCreationSettings(floorShape, JPH::RVec3(0.0_r, 0.0_r, 0.0_r), JPH::Quat::sIdentity(), JPH::EMotionType::Static, Physics::Layers::NON_MOVING);
+    auto* floor = Physics::body_interface->CreateBody(floor_settings);
     floor->SetRestitution(.0f);
+    floor->SetFriction(Game::terrainDefaultFriction);
 
     auto floorEntity                                                      = Game::registry.create();
     Game::registry.emplace<Game::ECS::Transform>(floorEntity).scale       = {1, 1, 1};
     Game::registry.emplace<Game::ECS::MeshRef>(floorEntity).mesh          = &Game::envMesh;
-    Game::registry.emplace<Game::ECS::Name>(floorEntity).string           = "Floor";
+    Game::registry.emplace<Game::ECS::Floor>(floorEntity);
     Game::registry.emplace<Game::ECS::PhysicsKinematic>(floorEntity).body = floor->GetID();
-    //Game::registry.emplace<Game::ECS::Tint>(floorEntity).color            = Game::terrainDefaultColor;
-    Game::registry.emplace<Game::ECS::Tint>(floorEntity).color            = Game::terrainFrockeyColor;
+    Game::registry.emplace<Game::ECS::Tint>(floorEntity).color            = Game::terrainDefaultColor;
 
     for (int i = 0; i < 5; i++)
     {
@@ -1015,28 +1136,13 @@ namespace
       {
         for (int k = 0; k < 8; k++)
         {
-          const float posY = float(10 * i + 3);
-          // Add moving sphere
-          auto sphere_settings = JPH::BodyCreationSettings(new JPH::SphereShape(0.5f), JPH::RVec3((float)k, posY, (float)j), JPH::Quat::sIdentity(), JPH::EMotionType::Dynamic, Physics::Layers::MOVING);
-          auto* sphere_ptr = Physics::body_interface->CreateBody(sphere_settings);
-          auto sphere_id = sphere_ptr->GetID();
-          Physics::body_interface->SetRestitution(sphere_id, .8f);
-
-          auto entity = Game::registry.create();
-          Game::registry.emplace<Game::ECS::Name>(entity).string = "Frog";
-          auto& transform = Game::registry.emplace<Game::ECS::Transform>(entity);
-
-          //transform.position = { 0, posY, -1 };
-          transform.scale = { 0.5f, 0.5f, 0.5f };
-
-          Game::registry.emplace<Game::ECS::MeshRef>(entity).mesh = &Game::sphereMesh;
-          Game::registry.emplace<Game::ECS::PhysicsDynamic>(entity).body = sphere_id;
-          Game::registry.emplace<Game::ECS::Tint>(entity).color          = {1, 0, 0};
-          Game::registry.emplace<Game::ECS::PreviousModel>(entity);
+          //SpawnRegularFrog({(float)k, 10 * i + 5, (float)j});
+          SpawnDung({(float)k, 10 * i + 5, (float)j});
         }
       }
     }
 
+    // Add player character
     auto characterSettings = JPH::CharacterSettings();
     characterSettings.SetEmbedded();
     characterSettings.mLayer = Physics::Layers::MOVING;
@@ -1045,8 +1151,7 @@ namespace
     Physics::character = new JPH::Character(&characterSettings, JPH::Vec3Arg(0, 2, 0), JPH::Quat::sIdentity(), 0, &Physics::engine);
     Physics::body_interface->SetRestitution(Physics::character->GetBodyID(), 0);
     Physics::character->AddToPhysicsSystem();
-    //Physics::body_interface->SetFriction(Physics::character->GetBodyID(), 123);
-
+    Physics::character->SetShape(new JPH::CapsuleShape(0.5f, 0.2f), FLT_MAX);
 
     struct ContactListenerImpl : JPH::ContactListener
     {
@@ -1057,21 +1162,53 @@ namespace
         [[maybe_unused]] const JPH::ContactManifold& inManifold,
         [[maybe_unused]] JPH::ContactSettings& ioSettings) override
       {
-        auto BodyHasName = [](JPH::BodyID body, const char* name) {
-          auto entity = Physics::bodyToEntity.find(body);
-          if (entity != Physics::bodyToEntity.end() && Game::registry.get<Game::ECS::Name>(entity->second).string == name)
-          {
-            return true;
-          }
-          return false;
-        };
+        auto ee1 = Physics::bodyToEntity.find(inBody1.GetID());
+        auto ee2 = Physics::bodyToEntity.find(inBody1.GetID());
 
+        entt::entity e1 = ee1 != Physics::bodyToEntity.end() ? ee1->second : entt::null;
+        entt::entity e2 = ee2 != Physics::bodyToEntity.end() ? ee2->second : entt::null;
+
+        entt::entity frog = entt::null;
+        entt::entity dung = entt::null;
+
+        if (e1 != entt::null && Game::registry.any_of<Game::ECS::Frog>(e1))
+        {
+          frog = e1;
+        }
+
+        if (e2 != entt::null && Game::registry.any_of<Game::ECS::Frog>(e2))
+        {
+          frog = e2;
+        }
+
+        if (e1 != entt::null && Game::registry.any_of<Game::ECS::Dung>(e1))
+        {
+          dung = e1;
+        }
+
+        if (e2 != entt::null && Game::registry.any_of<Game::ECS::Dung>(e2))
+        {
+          dung = e2;
+        }
+
+        // Check if the player collided with event thingy
         if (inBody1.GetID() == Physics::character->GetBodyID() || inBody2.GetID() == Physics::character->GetBodyID())
         {
-          if (BodyHasName(inBody1.GetID(), "Frog") || BodyHasName(inBody2.GetID(), "Frog"))
+          if (frog != entt::null)
           {
-            printf("ded");
+            // TODO: play death sound
+            //Game::SetState(Game::State::DIED);
           }
+
+          if (dung != entt::null)
+          {
+            Game::moneyCollected++;
+            Game::registry.emplace<Game::ECS::DeferDelete>(dung);
+          }
+        }
+        else if (frog != entt::null)
+        {
+          // TODO: play frog collision sound
         }
       }
     };
@@ -1082,14 +1219,14 @@ namespace
 
   void TerminateGame()
   {
-    Game::testMesh.vertexBuffer.reset();
-    Game::testMesh.indexBuffer.reset();
-
     Game::cubeMesh.vertexBuffer.reset();
     Game::cubeMesh.indexBuffer.reset();
 
     Game::sphereMesh.vertexBuffer.reset();
     Game::sphereMesh.indexBuffer.reset();
+
+    Game::frogMesh.vertexBuffer.reset();
+    Game::frogMesh.indexBuffer.reset();
 
     Game::envMesh.vertexBuffer.reset();
     Game::envMesh.indexBuffer.reset();
@@ -1097,6 +1234,26 @@ namespace
 
   void TickGameFixed(double dt)
   {
+    if (Game::state != Game::State::GAME && Game::state != Game::State::DIED)
+    {
+      return;
+    }
+
+    // Things still render and simulate, but the camera remains locked in place
+    if (Game::state == Game::State::DIED)
+    {
+      Game::timeSinceDied += dt;
+      if (Game::timeSinceDied > 3)
+      {
+        Game::SetState(Game::State::MAIN_MENU);
+      }
+    }
+
+    for (auto [entity] : Game::registry.view<Game::ECS::DeferDelete>().each())
+    {
+      Game::registry.destroy(entity);
+    }
+
     for (auto [entity] : Game::registry.view<Game::ECS::PhysicsKinematicAdded>().each())
     {
       const auto& body = Game::registry.get<Game::ECS::PhysicsKinematic>(entity).body;
@@ -1112,8 +1269,7 @@ namespace
       Physics::bodyToEntity.emplace(body, entity);
       Game::registry.remove<Game::ECS::PhysicsDynamicAdded>(entity);
     }
-
-    //Physics::character->ExtendedUpdate(float(dt), JPH::Vec3Arg(0, -10, 0), JPH::CharacterVirtual::ExtendedUpdateSettings{}, Physics::broad_phase_layer_interface, Physics::object_vs_object_layer_filter, Physics::)
+    
     Physics::engine.Update(float(dt), 1, Physics::tempAllocator, Physics::jobSystem);
     Physics::character->PostSimulation(.01f);
 
@@ -1141,6 +1297,11 @@ namespace
 
   void TickGameVariable([[maybe_unused]] double dt, float interpolant)
   {
+    if (Game::state != Game::State::GAME)
+    {
+      return;
+    }
+
     static float lastInterpolant = interpolant;
     const float dtf = static_cast<float>(dt);
     const glm::vec3 camForward = Game::mainCamera.GetForwardDir();
@@ -1226,6 +1387,8 @@ void MainLoop()
     auto curTime = glfwGetTime();
     auto dt = curTime - prevTime;
     prevTime = curTime;
+    
+    dt = glm::min(dt, GAME_TICK);
 
     App::cursorOffset = {};
     glfwPollEvents();
@@ -1238,9 +1401,10 @@ void MainLoop()
       TickGameFixed(GAME_TICK);
     }
 
-    TickGameVariable(dt, float(gameTickAccum / GAME_TICK));
+    const float interpolant = glm::min(1.0f, float(gameTickAccum / GAME_TICK));
+    TickGameVariable(dt, interpolant);
     TickUI(dt);
-    TickRender(dt, float(gameTickAccum / GAME_TICK));
+    TickRender(dt, interpolant);
   }
 }
 

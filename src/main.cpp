@@ -458,7 +458,7 @@ void main()
     int irsDonations                   = 0;
 
     constexpr glm::vec4 terrainDefaultColor = {.2, .5, .1, 0};
-    constexpr glm::vec4 terrainFrockeyColor = {1, 1, 1, 0};
+    constexpr glm::vec4 terrainFrockeyColor = {1, 1, 1, 15};
     float terrainDefaultFriction            = 0.2f;
     float terrainFrockeyFriction            = 0.0f;
 

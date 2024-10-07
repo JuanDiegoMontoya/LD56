@@ -13,6 +13,7 @@
 #include <Fwog/Shader.h>
 #include <Fwog/Pipeline.h>
 #include <Fwog/Buffer.h>
+#include <Fwog/Texture.h>
 
 #include <miniaudio.h>
 
@@ -27,6 +28,8 @@
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyActivationListener.h>
+#include <Jolt/Physics/Character/CharacterVirtual.h>
+#include <Jolt/Physics/Character/Character.h>
 
 #include <numeric>
 #include <filesystem>
@@ -59,14 +62,15 @@ namespace
     {
       glm::vec3 position{};
       glm::vec3 normal{};
-      glm::vec2 texcoord{};
+      glm::vec3 color{};
     };
 
     struct Mesh
     {
       std::optional<Fwog::TypedBuffer<Vertex>> vertexBuffer;
       std::optional<Fwog::TypedBuffer<index_t>> indexBuffer;
-      uint32_t indexCount = 0;
+      std::vector<Vertex> vertices;
+      std::vector<index_t> indices;
     };
 
     struct InstanceUniforms
@@ -76,12 +80,17 @@ namespace
 
     struct FrameUniforms
     {
-      glm::mat4 clip_from_world;
+      glm::mat4 clip_from_world{};
+      glm::mat4 light_from_world{};
+      glm::vec3 sunDirection = glm::normalize(glm::vec3{.2f, -1.f, 0});
     };
 
     std::optional<Fwog::GraphicsPipeline> pipeline;
+    std::optional<Fwog::GraphicsPipeline> shadowPipeline;
     std::optional<Fwog::TypedBuffer<InstanceUniforms>> instanceBuffer;
     std::optional<Fwog::TypedBuffer<FrameUniforms>> frameUniformsBuffer;
+    std::optional<Fwog::Texture> shadowMap;
+    FrameUniforms frameUniforms{};
 
     // Shaders
     namespace
@@ -93,7 +102,7 @@ struct Vertex
 {
   float px, py, pz;
   float nx, ny, nz;
-  float tx, ty;
+  float cr, cg, cb;
 };
 
 struct InstanceUniforms
@@ -109,6 +118,8 @@ layout(binding = 0, std430) readonly buffer VertexBuffer
 layout(binding = 1, std430) readonly buffer FrameUniforms
 {
   mat4 clip_from_world;
+  mat4 light_from_world;
+  vec3 sunDirection;
 }frame;
 
 layout(binding = 2, std430) readonly buffer InstanceBuffer
@@ -118,7 +129,7 @@ layout(binding = 2, std430) readonly buffer InstanceBuffer
 
 layout(location = 0) out vec3 v_position;
 layout(location = 1) out vec3 v_normal;
-layout(location = 2) out vec2 v_texcoord;
+layout(location = 2) out vec3 v_color;
 
 void main()
 {
@@ -131,7 +142,7 @@ void main()
 
   v_position = (instance.world_from_object * vec4(posObj, 1.0)).xyz;
   v_normal   = transpose(inverse(mat3(instance.world_from_object))) * normObj;
-  v_texcoord = vec2(v.tx, v.ty);
+  v_color    = vec3(v.cr, v.cg, v.cb);
 
   gl_Position = frame.clip_from_world * vec4(v_position, 1.0);
 }
@@ -140,16 +151,32 @@ void main()
       const char* sceneFragmentSource = R"(
 #version 460 core
 
-layout(location = 0) out vec4 o_color;
+layout(binding = 1, std430) readonly buffer FrameUniforms
+{
+  mat4 clip_from_world;
+  mat4 light_from_world;
+  vec3 sunDirection;
+}frame;
+
+layout(binding = 0) uniform sampler2DShadow s_shadowMap;
 
 layout(location = 0) in vec3 v_position;
 layout(location = 1) in vec3 v_normal;
-layout(location = 2) in vec2 v_texcoord;
+layout(location = 2) in vec3 v_color;
+
+layout(location = 0) out vec4 o_color;
 
 void main()
 {
-  o_color = vec4(v_normal * .5 + .5, 1.0);
-  //o_color = vec4(1.0);
+  // Shadow
+  const vec4 lightClip = frame.light_from_world * vec4(v_position, 1);
+  const vec3 lightNdc = lightClip.xyz / lightClip.w;
+  const vec3 lightUv = lightNdc * 0.5 + 0.5;
+  const float shadow = textureLod(s_shadowMap, lightUv, 0);
+  const float sunDiffuse = shadow * max(0, dot(v_normal, -frame.sunDirection));
+
+  const vec3 albedo = mix(v_color, v_normal * .5 + .5, .1);
+  o_color = vec4(sunDiffuse * albedo + vec3(.2) * albedo, 1.0);
 }
 )";
     }
@@ -263,6 +290,8 @@ void main()
     auto engine = JPH::PhysicsSystem();
     JPH::BodyInterface* body_interface{};
     std::unordered_map<JPH::BodyID, entt::entity, HashBodyID> bodyToEntity;
+    //JPH::CharacterVirtual* character{};
+    JPH::Character* character{};
   }
 
   namespace Game
@@ -322,12 +351,18 @@ void main()
 
     View mainCamera{};
     float cursorSensitivity = 0.0025f;
-    float cameraSpeed = 4.5f;
+    float playerAcceleration = 10;
+    float playerMaxSpeed = 2;
+    float playerInitialJumpVelocity = 3.5;       // Vertical speed immediately after pressing jump
+    float playerJumpAcceleration = 10;         // Vertical acceleration when holding jump
+    float playerTimeSinceOnGround = 1000;
+    float playerJumpModulationDuration = 0.2f; // Longer duration means more velocity can be added if the player holds jump
 
     // Game objects
     entt::registry registry;
     Render::Mesh testMesh;
-    entt::entity testEntity;
+    Render::Mesh cubeMesh;
+    Render::Mesh sphereMesh;
   }
 }
 
@@ -495,6 +530,7 @@ namespace
     glfwWindowHint(GLFW_DOUBLEBUFFER, GLFW_TRUE);
     glfwWindowHint(GLFW_SRGB_CAPABLE, GLFW_TRUE);
     glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, GLFW_TRUE);
+    glfwWindowHint(GLFW_SAMPLES, 4); // MSAA x4
 
     GLFWmonitor* monitor = glfwGetPrimaryMonitor();
     if (!monitor)
@@ -577,7 +613,7 @@ namespace
     auto& shapes = reader.GetShapes();
     //auto& materials = reader.GetMaterials();
 
-    auto vertices = std::vector<Render::Vertex>();
+    auto mesh = Render::Mesh{};
 
     // Loop over shapes
     for (const auto& shape : shapes)
@@ -608,51 +644,77 @@ namespace
             vertex.normal = { nx, ny, nz };
           }
 
-          // Check if `texcoord_index` is zero or positive. negative = no texcoord data
-          if (idx.texcoord_index >= 0)
-          {
-            tinyobj::real_t tx = attrib.texcoords[2 * size_t(idx.texcoord_index) + 0];
-            tinyobj::real_t ty = attrib.texcoords[2 * size_t(idx.texcoord_index) + 1];
-            vertex.texcoord = { tx, ty };
-          }
+          //// Check if `texcoord_index` is zero or positive. negative = no texcoord data
+          //if (idx.texcoord_index >= 0)
+          //{
+          //  tinyobj::real_t tx = attrib.texcoords[2 * size_t(idx.texcoord_index) + 0];
+          //  tinyobj::real_t ty = attrib.texcoords[2 * size_t(idx.texcoord_index) + 1];
+          //  vertex.texcoord = { tx, ty };
+          //}
 
           // Optional: vertex colors
-          // tinyobj::real_t red   = attrib.colors[3*size_t(idx.vertex_index)+0];
-          // tinyobj::real_t green = attrib.colors[3*size_t(idx.vertex_index)+1];
-          // tinyobj::real_t blue  = attrib.colors[3*size_t(idx.vertex_index)+2];
+          tinyobj::real_t red   = attrib.colors[3 * size_t(idx.vertex_index) + 0];
+          tinyobj::real_t green = attrib.colors[3 * size_t(idx.vertex_index) + 1];
+          tinyobj::real_t blue  = attrib.colors[3 * size_t(idx.vertex_index) + 2];
+          vertex.color = { red, green, blue };
 
-          vertices.push_back(vertex);
+          mesh.vertices.push_back(vertex);
         }
         index_offset += fv;
       }
     }
 
-    auto indices = std::vector<Render::index_t>(vertices.size());
-    std::iota(indices.begin(), indices.end(), 0);
-
-    auto mesh = Render::Mesh{};
-    mesh.indexCount = (uint32_t)indices.size();
-    mesh.indexBuffer.emplace(indices);
-    mesh.vertexBuffer.emplace(vertices);
+    mesh.indices = std::vector<Render::index_t>(mesh.vertices.size());
+    std::iota(mesh.indices.begin(), mesh.indices.end(), 0);
+    
+    mesh.indexBuffer.emplace(mesh.indices);
+    mesh.vertexBuffer.emplace(mesh.vertices);
     return mesh;
   }
 
   void InitializeRenderer()
   {
-    auto vertexShader = Fwog::Shader(Fwog::PipelineStage::VERTEX_SHADER, Render::sceneVertexSource);
-    auto fragmentShader = Fwog::Shader(Fwog::PipelineStage::FRAGMENT_SHADER, Render::sceneFragmentSource);
-    Render::pipeline = Fwog::GraphicsPipeline({
-      .vertexShader = &vertexShader,
-      .fragmentShader = &fragmentShader,
-      .rasterizationState = {.cullMode = Fwog::CullMode::NONE,},
-      .depthState = {.depthTestEnable = true, .depthWriteEnable = true,},
-      });
+    auto vertexShader   = Fwog::Shader(Fwog::PipelineStage::VERTEX_SHADER, Render::sceneVertexSource, "Scene vertex shader");
+    auto fragmentShader = Fwog::Shader(Fwog::PipelineStage::FRAGMENT_SHADER, Render::sceneFragmentSource, "Scene fragment shader");
+    Render::pipeline    = Fwog::GraphicsPipeline({
+         .name           = "Scene pipeline",
+         .vertexShader   = &vertexShader,
+         .fragmentShader = &fragmentShader,
+         .rasterizationState =
+        {
+             .cullMode = Fwog::CullMode::NONE,
+        },
+         .depthState =
+        {
+             .depthTestEnable  = true,
+             .depthWriteEnable = true,
+        },
+    });
 
     Render::frameUniformsBuffer.emplace(Fwog::BufferStorageFlag::DYNAMIC_STORAGE);
+    Render::shadowMap.emplace(Fwog::CreateTexture2D({2048, 2048}, Fwog::Format::D24_UNORM, "Shadow map"));
+    Render::shadowPipeline = Fwog::GraphicsPipeline({
+      .name         = "Shadow pipeline",
+      .vertexShader = &vertexShader,
+      .rasterizationState =
+        {
+          .cullMode = Fwog::CullMode::NONE,
+          .depthBiasEnable = true,
+          .depthBiasConstantFactor = 500,
+          .depthBiasSlopeFactor = 5,
+        },
+      .depthState =
+        {
+          .depthTestEnable  = true,
+          .depthWriteEnable = true,
+        },
+    });
   }
 
   void TerminateRenderer()
   {
+    Render::shadowPipeline.reset();
+    Render::shadowMap.reset();
     Render::instanceBuffer.reset();
     Render::frameUniformsBuffer.reset();
     Render::pipeline.reset();
@@ -665,47 +727,52 @@ namespace
 
     glEnable(GL_FRAMEBUFFER_SRGB);
 
-    Fwog::RenderToSwapchain(
-      Fwog::SwapchainRenderInfo{
-        .name = "Render Triangle",
-        .viewport = Fwog::Viewport{.drawRect{.offset = {0, 0}, .extent = {(uint32_t)App::windowSize.x, (uint32_t)App::windowSize.y}}},
-        .colorLoadOp = Fwog::AttachmentLoadOp::CLEAR,
-        .clearColorValue = {.2f, .0f, .2f, 1.0f},
-        .depthLoadOp = Fwog::AttachmentLoadOp::CLEAR,
-        .clearDepthValue = 1.0f,
+    struct Instance
+    {
+      size_t index;
+      Render::Mesh* mesh;
+    };
+
+    auto instanceData = std::vector<Render::InstanceUniforms>();
+    auto instances    = std::vector<Instance>();
+
+    auto view = Game::registry.view<Game::ECS::Transform, Game::ECS::MeshRef>();
+    for (auto&& [entity, transform, meshRef] : view.each())
+    {
+      instances.emplace_back(instanceData.size(), meshRef.mesh);
+      instanceData.emplace_back(glm::translate(glm::identity<glm::mat4>(), transform.position) * glm::mat4_cast(transform.rotation) *
+                                glm::scale(glm::identity<glm::mat4>(), transform.scale));
+    }
+
+    if (!Render::instanceBuffer || Render::instanceBuffer->Size() < instances.size() * sizeof(Render::InstanceUniforms))
+    {
+      Render::instanceBuffer.emplace(instanceData.size() * 3 / 2, Fwog::BufferStorageFlag::DYNAMIC_STORAGE, "Instance Data");
+    }
+
+    if (!instanceData.empty())
+    {
+      Render::instanceBuffer->UpdateData(instanceData);
+    }
+
+    const auto lightView_from_world = glm::lookAt(glm::vec3(0), Render::frameUniforms.sunDirection, glm::vec3(0, 1, 0));
+    Render::frameUniforms.light_from_world = glm::ortho(-50.0f, 50.0f, -50.0f, 50.0f, -200.0f, 200.0f) * lightView_from_world;
+
+    Fwog::Render(
+      Fwog::RenderInfo{
+        .name = "Shadow pass",
+        .depthAttachment =
+          Fwog::RenderDepthStencilAttachment{
+            .texture    = Render::shadowMap.value(),
+            .loadOp     = Fwog::AttachmentLoadOp::CLEAR,
+            .clearValue = {.depth = 1},
+          },
       },
       [&]
       {
-        auto projection = glm::perspective(glm::radians(60.0f), (float)App::windowSize.x / (float)App::windowSize.y, 0.1f, 100.0f);
-        Render::frameUniformsBuffer->UpdateData(Render::FrameUniforms{.clip_from_world = projection * Game::mainCamera.GetViewMatrix()});
+        Render::frameUniforms.clip_from_world = Render::frameUniforms.light_from_world;
+        Render::frameUniformsBuffer->UpdateData(Render::frameUniforms);
 
-        struct Instance
-        {
-          size_t index;
-          Render::Mesh* mesh;
-        };
-
-        auto instanceData = std::vector<Render::InstanceUniforms>();
-        auto instances = std::vector<Instance>();
-
-        auto view = Game::registry.view<Game::ECS::Transform, Game::ECS::MeshRef>();
-        for (auto&& [entity, transform, meshRef] : view.each())
-        {
-          instances.emplace_back(instanceData.size(), meshRef.mesh);
-          instanceData.emplace_back(glm::translate(glm::identity<glm::mat4>(), transform.position) * glm::mat4_cast(transform.rotation) * glm::scale(glm::identity<glm::mat4>(), transform.scale));
-        }
-
-        if (!Render::instanceBuffer || Render::instanceBuffer->Size() < instances.size() * sizeof(Render::InstanceUniforms))
-        {
-          Render::instanceBuffer.emplace(instanceData.size() * 3 / 2, Fwog::BufferStorageFlag::DYNAMIC_STORAGE, "Instance Data");
-        }
-
-        if (!instanceData.empty())
-        {
-          Render::instanceBuffer->UpdateData(instanceData);
-        }
-
-        Fwog::Cmd::BindGraphicsPipeline(Render::pipeline.value());
+        Fwog::Cmd::BindGraphicsPipeline(Render::shadowPipeline.value());
         Fwog::Cmd::BindStorageBuffer(1, Render::frameUniformsBuffer.value());
         Fwog::Cmd::BindStorageBuffer(2, Render::instanceBuffer.value());
 
@@ -714,7 +781,45 @@ namespace
           const auto& instance = instances[i];
           Fwog::Cmd::BindIndexBuffer(instance.mesh->indexBuffer.value(), Fwog::IndexType::UNSIGNED_INT);
           Fwog::Cmd::BindStorageBuffer(0, instance.mesh->vertexBuffer.value());
-          Fwog::Cmd::DrawIndexed(instance.mesh->indexCount, 1, 0, 0, (uint32_t)i);
+          Fwog::Cmd::DrawIndexed((uint32_t)instance.mesh->indices.size(), 1, 0, 0, (uint32_t)i);
+        }
+      });
+
+    Fwog::RenderToSwapchain(
+      Fwog::SwapchainRenderInfo{
+        .name            = "Scene pass",
+        .viewport        = Fwog::Viewport{.drawRect{.offset = {0, 0}, .extent = {(uint32_t)App::windowSize.x, (uint32_t)App::windowSize.y}}},
+        .colorLoadOp     = Fwog::AttachmentLoadOp::CLEAR,
+        .clearColorValue = {.3f, .4f, .75f, 1.0f},
+        .depthLoadOp     = Fwog::AttachmentLoadOp::CLEAR,
+        .clearDepthValue = 1.0f,
+      },
+      [&]
+      {
+        auto projection = glm::perspective(glm::radians(60.0f), (float)App::windowSize.x / (float)App::windowSize.y, 0.1f, 200.0f);
+        Render::frameUniforms.clip_from_world = projection * Game::mainCamera.GetViewMatrix();
+        Render::frameUniformsBuffer->UpdateData(Render::frameUniforms);
+
+        Fwog::Cmd::BindGraphicsPipeline(Render::pipeline.value());
+        Fwog::Cmd::BindStorageBuffer(1, Render::frameUniformsBuffer.value());
+        Fwog::Cmd::BindStorageBuffer(2, Render::instanceBuffer.value());
+        Fwog::Cmd::BindSampledImage(0,
+          Render::shadowMap.value(),
+          Fwog::Sampler({
+            .minFilter    = Fwog::Filter::LINEAR,
+            .magFilter    = Fwog::Filter::LINEAR,
+            .addressModeU = Fwog::AddressMode::CLAMP_TO_EDGE,
+            .addressModeV = Fwog::AddressMode::CLAMP_TO_EDGE,
+            .compareEnable = true,
+            .compareOp     = Fwog::CompareOp::LESS,
+          }));
+
+        for (size_t i = 0; i < instances.size(); i++)
+        {
+          const auto& instance = instances[i];
+          Fwog::Cmd::BindIndexBuffer(instance.mesh->indexBuffer.value(), Fwog::IndexType::UNSIGNED_INT);
+          Fwog::Cmd::BindStorageBuffer(0, instance.mesh->vertexBuffer.value());
+          Fwog::Cmd::DrawIndexed((uint32_t)instance.mesh->indices.size(), 1, 0, 0, (uint32_t)i);
         }
       });
 
@@ -730,7 +835,7 @@ namespace
     glfwSwapBuffers(App::window);
   }
 
-  void TickUI(double dt)
+  void TickUI([[maybe_unused]] double dt)
   {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
@@ -786,25 +891,13 @@ namespace
     Physics::tempAllocator = new JPH::TempAllocatorImpl(10 * 1024 * 1024);
     Physics::jobSystem = new JPH::JobSystemThreadPool(JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers, std::thread::hardware_concurrency() - 1);
     
-    constexpr JPH::uint cMaxBodies = 1024;
+    constexpr JPH::uint cMaxBodies = 2024;
     constexpr JPH::uint cNumBodyMutexes = 0;
-    constexpr JPH::uint cMaxBodyPairs = 1024;
-    constexpr JPH::uint cMaxContactConstraints = 1024;
+    constexpr JPH::uint cMaxBodyPairs = 2024;
+    constexpr JPH::uint cMaxContactConstraints = 2024;
     Physics::engine.Init(cMaxBodies, cNumBodyMutexes, cMaxBodyPairs, cMaxContactConstraints, Physics::broad_phase_layer_interface, Physics::object_vs_broadphase_layer_filter, Physics::object_vs_object_layer_filter);
 
     Physics::body_interface = &Physics::engine.GetBodyInterface();
-    
-    // Add static floor
-    auto floor_shape_settings = JPH::BoxShapeSettings(JPH::Vec3(100, 1, 100));
-    floor_shape_settings.SetEmbedded();
-    auto floor_shape_result = floor_shape_settings.Create();
-    auto floor_shape = floor_shape_result.Get();
-    auto floor_settings = JPH::BodyCreationSettings(floor_shape, JPH::RVec3(0.0_r, -1.0_r, 0.0_r), JPH::Quat::sIdentity(), JPH::EMotionType::Static, Physics::Layers::NON_MOVING);
-    auto* floor = Physics::body_interface->CreateBody(floor_settings); // Note that if we run out of bodies this can return nullptr
-    floor->SetRestitution(.5f);
-    Physics::body_interface->AddBody(floor->GetID(), JPH::EActivation::DontActivate);
-
-    Physics::engine.OptimizeBroadPhase();
   }
 
   void TerminatePhysics()
@@ -819,37 +912,64 @@ namespace
 {
   void InitializeGame()
   {
-    Game::testEntity = Game::registry.create();
-    Game::registry.emplace<Game::ECS::Name>(Game::testEntity).string = "Hello";
-    auto& transform = Game::registry.emplace<Game::ECS::Transform>(Game::testEntity);
-
-    transform.position = { 0, 0, -1 };
-
+    Game::mainCamera.position = { 5, 3, 0 };
     Game::testMesh = LoadObjFile(GetDataDirectory() / "models/bunny.obj");
+    Game::cubeMesh = LoadObjFile(GetDataDirectory() / "models/cube.obj");
+    Game::sphereMesh = LoadObjFile(GetDataDirectory() / "models/frog.obj");
 
-    //Render::Vertex vertices[] = {
-    //  Render::Vertex{{0, 0, 0}},
-    //  Render::Vertex{{1, -1, 0}},
-    //  Render::Vertex{{1, 1, 0}},
-    //};
-    //uint32_t indices[] = { 0, 1, 2 };
+    // Add static floor
+    auto floor_shape_settings = JPH::BoxShapeSettings(JPH::Vec3(100, 1, 100));
+    floor_shape_settings.SetEmbedded();
+    auto floor_shape_result = floor_shape_settings.Create();
+    auto& floor_shape = floor_shape_result.Get();
+    auto floor_settings = JPH::BodyCreationSettings(floor_shape, JPH::RVec3(0.0_r, -1.0_r, 0.0_r), JPH::Quat::sIdentity(), JPH::EMotionType::Static, Physics::Layers::NON_MOVING);
+    auto* floor = Physics::body_interface->CreateBody(floor_settings); // Note that if we run out of bodies this can return nullptr
+    floor->SetRestitution(.0f);
+    
+    auto floorEntity = Game::registry.create();
+    Game::registry.emplace<Game::ECS::Transform>(floorEntity).scale = {100, 1, 100};
+    Game::registry.emplace<Game::ECS::MeshRef>(floorEntity).mesh = &Game::cubeMesh;
+    Game::registry.emplace<Game::ECS::Name>(floorEntity).string = "Floor";
+    Game::registry.emplace<Game::ECS::PhysicsKinematic>(floorEntity).body = floor->GetID();
 
-    //Game::testMesh.vertexBuffer.emplace(std::span<const Render::Vertex>(vertices));
-    //Game::testMesh.indexBuffer.emplace(std::span<const uint32_t>(indices));
-    //Game::testMesh.indexCount = std::size(indices);
+    for (int i = 0; i < 1; i++)
+    {
+      for (int j = 0; j < 8; j++)
+      {
+        for (int k = 0; k < 8; k++)
+        {
+          const float posY = float(10 * i + 1);
+          // Add moving sphere
+          auto sphere_settings = JPH::BodyCreationSettings(new JPH::SphereShape(0.5f), JPH::RVec3((float)k, posY, (float)j), JPH::Quat::sIdentity(), JPH::EMotionType::Dynamic, Physics::Layers::MOVING);
+          auto* sphere_ptr = Physics::body_interface->CreateBody(sphere_settings);
+          auto sphere_id = sphere_ptr->GetID();
+          Physics::body_interface->SetRestitution(sphere_id, .8f);
 
-    Game::registry.emplace<Game::ECS::MeshRef>(Game::testEntity).mesh = &Game::testMesh;
+          auto entity = Game::registry.create();
+          Game::registry.emplace<Game::ECS::Name>(entity).string = "Object";
+          auto& transform = Game::registry.emplace<Game::ECS::Transform>(entity);
 
-    // Add moving sphere
-    auto sphere_settings = JPH::BodyCreationSettings(new JPH::SphereShape(0.5f), JPH::RVec3(0.0_r, 3.0_r, 0.0_r), JPH::Quat::sIdentity(), JPH::EMotionType::Dynamic, Physics::Layers::MOVING);
-    auto* sphere_ptr = Physics::body_interface->CreateBody(sphere_settings);
-    auto sphere_id = sphere_ptr->GetID();
+          //transform.position = { 0, posY, -1 };
+          transform.scale = { 0.5f, 0.5f, 0.5f };
 
-    Physics::body_interface->SetRestitution(sphere_id, .8f);
+          Game::registry.emplace<Game::ECS::MeshRef>(entity).mesh = &Game::sphereMesh;
+          Game::registry.emplace<Game::ECS::PhysicsDynamic>(entity).body = sphere_id;
+        }
+      }
+    }
 
-    Game::ECS::PhysicsDynamic asdf;
-    asdf.body = sphere_id;
-    Game::registry.emplace<Game::ECS::PhysicsDynamic>(Game::testEntity, asdf);
+    //auto characterSettings = JPH::CharacterVirtualSettings();
+    //characterSettings.SetEmbedded();
+    //Physics::character = new JPH::CharacterVirtual(&characterSettings, JPH::Vec3Arg(), JPH::Quat::sIdentity(), 0, &Physics::engine);
+
+    auto characterSettings = JPH::CharacterSettings();
+    characterSettings.SetEmbedded();
+    characterSettings.mLayer = Physics::Layers::MOVING;
+    characterSettings.mShape = new JPH::SphereShape(0.5f);
+    characterSettings.mFriction = 1.2f;
+    Physics::character = new JPH::Character(&characterSettings, JPH::Vec3Arg(0, 2, 0), JPH::Quat::sIdentity(), 0, &Physics::engine);
+    Physics::body_interface->SetRestitution(Physics::character->GetBodyID(), 0);
+    Physics::character->AddToPhysicsSystem();
 
     Physics::engine.OptimizeBroadPhase();
   }
@@ -858,6 +978,12 @@ namespace
   {
     Game::testMesh.vertexBuffer.reset();
     Game::testMesh.indexBuffer.reset();
+
+    Game::cubeMesh.vertexBuffer.reset();
+    Game::cubeMesh.indexBuffer.reset();
+
+    Game::sphereMesh.vertexBuffer.reset();
+    Game::sphereMesh.indexBuffer.reset();
   }
 
   void TickGameFixed(double dt)
@@ -877,11 +1003,15 @@ namespace
       Physics::bodyToEntity.emplace(body, entity);
       Game::registry.remove<Game::ECS::PhysicsDynamicAdded>(entity);
     }
-    
+
+    //Physics::character->ExtendedUpdate(float(dt), JPH::Vec3Arg(0, -10, 0), JPH::CharacterVirtual::ExtendedUpdateSettings{}, Physics::broad_phase_layer_interface, Physics::object_vs_object_layer_filter, Physics::)
     Physics::engine.Update(float(dt), 1, Physics::tempAllocator, Physics::jobSystem);
+    Physics::character->PostSimulation(.01f);
+    
 
     auto bodies = JPH::BodyIDVector();
-    Physics::engine.GetActiveBodies(JPH::EBodyType::RigidBody, bodies);
+    //Physics::engine.GetActiveBodies(JPH::EBodyType::RigidBody, bodies);
+    Physics::engine.GetBodies(bodies);
 
     for (const auto& body : bodies)
     {
@@ -904,23 +1034,66 @@ namespace
   void TickGameVariable([[maybe_unused]] double dt)
   {
     const float dtf = static_cast<float>(dt);
-    const glm::vec3 forward = Game::mainCamera.GetForwardDir();
+    const glm::vec3 camForward = Game::mainCamera.GetForwardDir();
+    const auto forward = glm::normalize(glm::vec3{ camForward.x, 0, camForward.z });
     const glm::vec3 right = glm::normalize(glm::cross(forward, { 0, 1, 0 }));
+    auto impulse = glm::vec3{};
     if (glfwGetKey(App::window, GLFW_KEY_W) == GLFW_PRESS)
-      Game::mainCamera.position += forward * dtf * Game::cameraSpeed;
+      impulse += forward * Game::playerAcceleration * dtf;
     if (glfwGetKey(App::window, GLFW_KEY_S) == GLFW_PRESS)
-      Game::mainCamera.position -= forward * dtf * Game::cameraSpeed;
+      impulse -= forward * Game::playerAcceleration * dtf;
     if (glfwGetKey(App::window, GLFW_KEY_D) == GLFW_PRESS)
-      Game::mainCamera.position += right * dtf * Game::cameraSpeed;
+      impulse += right * Game::playerAcceleration * dtf;
     if (glfwGetKey(App::window, GLFW_KEY_A) == GLFW_PRESS)
-      Game::mainCamera.position -= right * dtf * Game::cameraSpeed;
-    if (glfwGetKey(App::window, GLFW_KEY_Q) == GLFW_PRESS)
-      Game::mainCamera.position.y -= dtf * Game::cameraSpeed;
-    if (glfwGetKey(App::window, GLFW_KEY_E) == GLFW_PRESS)
-      Game::mainCamera.position.y += dtf * Game::cameraSpeed;
+      impulse -= right * Game::playerAcceleration * dtf;
+
+    // Clamp impulse so diagonal input doesn't increase acceleration
+    if (auto impulseLen = glm::length(impulse); impulseLen > Game::playerAcceleration)
+    {
+      impulse = impulse / impulseLen * Game::playerAcceleration;
+    }
+    Physics::character->AddLinearVelocity(JPH::Vec3Arg(impulse.x, impulse.y, impulse.z));
+
+    if (Physics::character->GetGroundState() == JPH::CharacterBase::EGroundState::OnGround)
+    {
+      Game::playerTimeSinceOnGround = 0;
+    }
+    else
+    {
+      Game::playerTimeSinceOnGround += dtf;
+    }
+
+    // Player tried to jump
+    if (Game::playerTimeSinceOnGround <= Game::playerJumpModulationDuration && glfwGetKey(App::window, GLFW_KEY_SPACE) == GLFW_PRESS)
+    {
+      if (Physics::character->GetGroundState() == JPH::CharacterBase::EGroundState::OnGround)
+      {
+        auto vel = Physics::character->GetLinearVelocity();
+        vel.SetY(Game::playerInitialJumpVelocity); // Remove possible downwards velocity
+        Physics::character->SetLinearVelocity(vel);
+        auto pos = Physics::character->GetPosition();
+        pos.SetY(pos.GetY() + 0.01f); // Unstick the player from the ground
+        Physics::character->SetPosition(pos);
+        // TODO: play sound
+      }
+
+      Physics::character->AddLinearVelocity(JPH::Vec3Arg(0, Game::playerJumpAcceleration * dtf, 0));
+    }
     Game::mainCamera.yaw += static_cast<float>(App::cursorOffset.x * Game::cursorSensitivity);
     Game::mainCamera.pitch += static_cast<float>(App::cursorOffset.y * Game::cursorSensitivity);
     Game::mainCamera.pitch = glm::clamp(Game::mainCamera.pitch, -glm::half_pi<float>() + 1e-4f, glm::half_pi<float>() - 1e-4f);
+
+    auto p = Physics::character->GetPosition();
+    Game::mainCamera.position = {p.GetX(), p.GetY(), p.GetZ()};
+
+    // Clamp horizontal speed
+    auto vel = Physics::character->GetLinearVelocity();
+    if (auto speed = glm::length(glm::vec2(vel.GetX(), vel.GetZ())); speed > Game::playerMaxSpeed)
+    {
+      vel.SetX(vel.GetX() / speed * Game::playerMaxSpeed);
+      vel.SetZ(vel.GetZ() / speed * Game::playerMaxSpeed);
+      Physics::character->SetLinearVelocity(vel);
+    }
   }
 }
 

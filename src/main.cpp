@@ -43,6 +43,7 @@
 #include <thread>
 #include <unordered_map>
 #include <functional>
+#include <shared_mutex>
 
 using namespace JPH::literals;
 
@@ -344,6 +345,50 @@ void main()
     std::unordered_map<JPH::BodyID, entt::entity, HashBodyID> bodyToEntity;
     //JPH::CharacterVirtual* character{};
     JPH::Character* character{};
+    std::shared_mutex contactListenerMutex;
+  } // namespace Physics
+
+  namespace Audio
+  {
+    ma_engine engine;
+    std::vector<ma_sound*> activeSounds;
+
+    ma_sound jumpPrototype{};
+    ma_sound coinPrototype{};
+    ma_sound diedPrototype{};
+    ma_sound impactPrototype{};
+
+    // Copies the input sound
+    ma_sound* AddSound(const ma_sound& prototype, ma_uint32 soundFlags = 0)
+    {
+      //ma_sound sound{};
+      auto sound = new ma_sound();
+      if (ma_sound_init_copy(&engine, &prototype, soundFlags, nullptr, sound) != MA_SUCCESS)
+      {
+        throw std::runtime_error("Failed to copy sound");
+      }
+      if (ma_sound_start(sound) != MA_SUCCESS)
+      {
+        throw std::runtime_error("Failed to start sound");
+      }
+      activeSounds.push_back(sound);
+      return sound;
+    }
+
+    void RemoveStaleSounds()
+    {
+      std::erase_if(activeSounds,
+        [](ma_sound* sound)
+        {
+          if (!ma_sound_is_playing(sound))
+          {
+            ma_sound_uninit(sound);
+            delete sound;
+            return true;
+          }
+          return false;
+        });
+    }
   }
 
   namespace Game
@@ -436,6 +481,7 @@ void main()
     };
 
     View mainCamera{};
+    float timeSinceJumped              = 0;
     float cursorSensitivity            = 0.25f;
     float fovyDeg                      = 60.0f;
     float playerAcceleration           = 12;
@@ -1029,7 +1075,7 @@ namespace
     {
       glfwSetInputMode(App::window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
       ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-      ImGui::SetNextWindowSize(ImVec2(370, 420));
+      ImGui::SetNextWindowSize(ImVec2(370, 450));
       if (ImGui::Begin("common", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDecoration))
       {
         // Show difficulty selectors
@@ -1069,6 +1115,11 @@ namespace
 
         // Options
         ImGui::SeparatorText("Options");
+        float volume = ma_engine_get_volume(&Audio::engine);
+        if (ImGui::SliderFloat("Volume", &volume, 0, 1, "%.2f"))
+        {
+          ma_engine_set_volume(&Audio::engine, volume);
+        }
         ImGui::SliderFloat("Cursor speed", &Game::cursorSensitivity, 0, 2, "%.2f");
         ImGui::SliderFloat("FoV", &Game::fovyDeg, 30, 90, "%.0f");
         ImGui::NewLine();
@@ -1087,7 +1138,7 @@ namespace
       // TODO:: show money and time
 
       ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.15f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-      ImGui::SetNextWindowSize(ImVec2(160, 90));
+      ImGui::SetNextWindowSize(ImVec2(190, 90));
       if (ImGui::Begin("common", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground))
       {
         ImGui::Text("Difficulty: %d", Game::difficulty);
@@ -1488,11 +1539,40 @@ namespace
   {
     PCG::state = PCG::Hash((uint32_t)std::time(nullptr));
 
+    if (ma_engine_init(nullptr, &Audio::engine) != MA_SUCCESS)
+    {
+      throw std::runtime_error("Failed to initialize audio engine");
+    }
+
+    ma_engine_set_volume(&Audio::engine, 0.5f);
+
+    if (ma_sound_init_from_file(&Audio::engine, (GetDataDirectory() / "audio/jump.wav").string().c_str(), 0, nullptr, nullptr, &Audio::jumpPrototype) != MA_SUCCESS)
+    {
+      throw std::runtime_error("Failed to load sound");
+    }
+    ma_sound_set_volume(&Audio::jumpPrototype, 0.5f);
+
+    if (ma_sound_init_from_file(&Audio::engine, (GetDataDirectory() / "audio/coin.wav").string().c_str(), 0, nullptr, nullptr, &Audio::coinPrototype) != MA_SUCCESS)
+    {
+      throw std::runtime_error("Failed to load sound");
+    }
+
+    if (ma_sound_init_from_file(&Audio::engine, (GetDataDirectory() / "audio/died.wav").string().c_str(), 0, nullptr, nullptr, &Audio::diedPrototype) != MA_SUCCESS)
+    {
+      throw std::runtime_error("Failed to load sound");
+    }
+
+    if (ma_sound_init_from_file(&Audio::engine, (GetDataDirectory() / "audio/frog_impact.wav").string().c_str(), 0, nullptr, nullptr, &Audio::impactPrototype) != MA_SUCCESS)
+    {
+      throw std::runtime_error("Failed to load sound");
+    }
+    
+
     PopulateShop();
-    Game::cubeMesh            = LoadObjFile(GetDataDirectory() / "models/cube.obj");
-    Game::sphereMesh          = LoadObjFile(GetDataDirectory() / "models/sphere.obj");
-    Game::frogMesh            = LoadObjFile(GetDataDirectory() / "models/frog.obj");
-    Game::envMesh             = LoadObjFile(GetDataDirectory() / "models/ground.obj");
+    Game::cubeMesh   = LoadObjFile(GetDataDirectory() / "models/cube.obj");
+    Game::sphereMesh = LoadObjFile(GetDataDirectory() / "models/sphere.obj");
+    Game::frogMesh   = LoadObjFile(GetDataDirectory() / "models/frog.obj");
+    Game::envMesh    = LoadObjFile(GetDataDirectory() / "models/ground.obj");
 
     // Add static floor
     auto floorShape = CreateMeshShape(Game::envMesh);
@@ -1528,57 +1608,77 @@ namespace
         [[maybe_unused]] const JPH::ContactManifold& inManifold,
         [[maybe_unused]] JPH::ContactSettings& ioSettings) override
       {
-        auto ee1 = Physics::bodyToEntity.find(inBody1.GetID());
-        auto ee2 = Physics::bodyToEntity.find(inBody2.GetID());
-
-        entt::entity e1 = ee1 != Physics::bodyToEntity.end() ? ee1->second : entt::null;
-        entt::entity e2 = ee2 != Physics::bodyToEntity.end() ? ee2->second : entt::null;
-
         entt::entity frog = entt::null;
         entt::entity dung = entt::null;
 
-        if (e1 != entt::null && Game::registry.any_of<Game::ECS::Frog>(e1))
         {
-          frog = e1;
-        }
+          // Following section reads, shared access suffices
+          auto shared = std::shared_lock(Physics::contactListenerMutex);
+          auto ee1    = Physics::bodyToEntity.find(inBody1.GetID());
+          auto ee2    = Physics::bodyToEntity.find(inBody2.GetID());
 
-        if (e2 != entt::null && Game::registry.any_of<Game::ECS::Frog>(e2))
-        {
-          frog = e2;
-        }
+          entt::entity e1 = ee1 != Physics::bodyToEntity.end() ? ee1->second : entt::null;
+          entt::entity e2 = ee2 != Physics::bodyToEntity.end() ? ee2->second : entt::null;
 
-        if (e1 != entt::null && Game::registry.any_of<Game::ECS::Dung>(e1))
-        {
-          dung = e1;
-        }
-
-        if (e2 != entt::null && Game::registry.any_of<Game::ECS::Dung>(e2))
-        {
-          dung = e2;
-        }
-
-        // Check if the player collided with event thingy
-        if (inBody1.GetID() == Physics::character->GetBodyID() || inBody2.GetID() == Physics::character->GetBodyID())
-        {
-          if (frog != entt::null)
+          if (e1 != entt::null && Game::registry.any_of<Game::ECS::Frog>(e1))
           {
-            if ((!Game::playerHasCamoufroge || PCG::RandU32(PCG::state) % 2 == 0) && Game::timeSinceDied <= 0)
+            frog = e1;
+          }
+
+          if (e2 != entt::null && Game::registry.any_of<Game::ECS::Frog>(e2))
+          {
+            frog = e2;
+          }
+
+          if (e1 != entt::null && Game::registry.any_of<Game::ECS::Dung>(e1))
+          {
+            dung = e1;
+          }
+
+          if (e2 != entt::null && Game::registry.any_of<Game::ECS::Dung>(e2))
+          {
+            dung = e2;
+          }
+        }
+
+        {
+          // Following section writes, exclusive access is required
+          auto lock = std::unique_lock(Physics::contactListenerMutex);
+
+          // Check if the player collided with event thingy
+          if (inBody1.GetID() == Physics::character->GetBodyID() || inBody2.GetID() == Physics::character->GetBodyID())
+          {
+            if (frog != entt::null)
             {
-              // TODO: play death sound
-              Game::SetState(Game::State::DIED);
-              Game::deathMessageIndex = PCG::RandU32(PCG::state) % std::size(Game::deathMessages);
+              if ((!Game::playerHasCamoufroge || PCG::RandU32(PCG::state) % 2 == 0) && Game::timeSinceDied <= 0)
+              {
+                Game::SetState(Game::State::DIED);
+                Game::deathMessageIndex = PCG::RandU32(PCG::state) % std::size(Game::deathMessages);
+                Audio::AddSound(Audio::diedPrototype, MA_SOUND_FLAG_NO_SPATIALIZATION);
+              }
+            }
+
+            if (dung != entt::null)
+            {
+              Game::moneyCollected++;
+              Game::registry.emplace<Game::ECS::DeferDelete>(dung);
+              Audio::AddSound(Audio::coinPrototype, MA_SOUND_FLAG_NO_SPATIALIZATION);
             }
           }
-
-          if (dung != entt::null)
+          else if (frog != entt::null)
           {
-            Game::moneyCollected++;
-            Game::registry.emplace<Game::ECS::DeferDelete>(dung);
+            auto vv1  = inBody1.GetLinearVelocity();
+            auto vv2  = inBody2.GetLinearVelocity();
+            auto v1   = glm::vec3(vv1.GetX(), vv1.GetY(), vv1.GetZ());
+            auto v2   = glm::vec3(vv2.GetX(), vv2.GetY(), vv2.GetZ());
+            auto maxV = glm::max(glm::length(v1), glm::length(v2));
+            if (maxV > 2)
+            {
+              auto* sound = Audio::AddSound(Audio::impactPrototype);
+              const auto& fpos = Game::registry.get<Game::ECS::Transform>(frog).position;
+              ma_sound_set_position(sound, fpos.x, fpos.y, fpos.z);
+            }
           }
-        }
-        else if (frog != entt::null)
-        {
-          // TODO: play frog collision sound
         }
       }
     };
@@ -1604,6 +1704,8 @@ namespace
 
   void TickGameFixed(double dt)
   {
+    Audio::RemoveStaleSounds();
+
     if (Game::state != Game::State::GAME && Game::state != Game::State::DIED)
     {
       return;
@@ -1625,6 +1727,7 @@ namespace
       Physics::character->SetPosition(pos);
       Game::SetState(Game::State::DIED);
       Game::deathMessageIndex = PCG::RandU32(PCG::state) % std::size(Game::deathMessages);
+      Audio::AddSound(Audio::diedPrototype, MA_SOUND_FLAG_NO_SPATIALIZATION);
     }
     
     auto deleted = Game::registry.view<Game::ECS::DeferDelete>();
@@ -1792,11 +1895,14 @@ namespace
       Game::playerTimeSinceOnGround += dtf;
     }
 
+    Game::timeSinceJumped += dtf;
+
     // Player tried to jump
     if (Game::playerTimeSinceOnGround <= Game::playerJumpModulationDuration && glfwGetKey(App::window, GLFW_KEY_SPACE) == GLFW_PRESS)
     {
-      if (Physics::character->GetGroundState() == JPH::CharacterBase::EGroundState::OnGround)
+      if (Physics::character->GetGroundState() == JPH::CharacterBase::EGroundState::OnGround && Game::timeSinceJumped > 0.25f)
       {
+        Game::timeSinceJumped = 0;
         //auto vel = Physics::character->GetLinearVelocity();
         vel.SetY(Game::playerInitialJumpVelocity); // Remove possible downwards velocity
         Physics::character->SetLinearVelocity(vel);
@@ -1804,6 +1910,8 @@ namespace
         pos.SetY(pos.GetY() + 0.01f); // Unstick the player from the ground
         Physics::character->SetPosition(pos);
         // TODO: play sound
+        Audio::AddSound(Audio::jumpPrototype, MA_SOUND_FLAG_NO_SPATIALIZATION);
+        //ma_engine_play_sound(&Audio::engine, (GetDataDirectory() / "audio/jump.wav").string().c_str(), nullptr);
       }
 
       Physics::character->AddLinearVelocity(JPH::Vec3Arg(0, Game::playerJumpAcceleration * dtf, 0));
@@ -1817,6 +1925,8 @@ namespace
     glm::vec3 currentCameraPos = {p.GetX(), p.GetY(), p.GetZ()};
 
     Game::mainCamera.position = glm::mix(oldCameraPos, currentCameraPos, interpolant);
+
+    ma_engine_listener_set_position(&Audio::engine, 0, currentCameraPos.x, currentCameraPos.y, currentCameraPos.z);
 
     if (interpolant < lastInterpolant)
     {

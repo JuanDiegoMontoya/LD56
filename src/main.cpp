@@ -730,7 +730,6 @@ namespace
       throw std::runtime_error("Failed to find monitor");
     }
     const GLFWvidmode* videoMode = glfwGetVideoMode(monitor);
-    // TODO: update app title
     App::window = glfwCreateWindow(static_cast<int>(videoMode->width * .75), static_cast<int>(videoMode->height * .75), "Afrocalypse", nullptr, nullptr);
     if (!App::window)
     {
@@ -1135,8 +1134,6 @@ namespace
     case Game::State::GAME:
     {
       glfwSetInputMode(App::window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-      // TODO:: show money and time
-
       ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.15f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
       ImGui::SetNextWindowSize(ImVec2(190, 90));
       if (ImGui::Begin("common", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground))
@@ -1383,7 +1380,7 @@ namespace
     {
       speedRow.items.push_back(Game::ShopItem{
         .cost       = 5 + 10 * i,
-        .name       = "Budgett's walking stick",
+        .name       = "Budgett's walking stick     ",
         .tooltip    = "Increase max speed by 20%",
         .onPurchase = [] { Game::playerMaxSpeed *= 1.2f; },
         .onRefund   = [] { Game::playerMaxSpeed /= 1.2f; },
@@ -1396,7 +1393,7 @@ namespace
     {
       accelRow.items.push_back(Game::ShopItem{
         .cost       = 4 + 4 * i,
-        .name       = "Wednesday siren",
+        .name       = "Wednesday siren             ",
         .tooltip    = "Increase acceleration by 30%",
         .onPurchase = [] { Game::playerAcceleration *= 1.3f; },
         .onRefund   = [] { Game::playerAcceleration /= 1.3f; },
@@ -1502,7 +1499,8 @@ namespace
         {
           ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 1));
         }
-        if (ImGui::Button(std::to_string(item.cost).c_str()))
+        // Hacky way to make rows have thinner elements
+        if (ImGui::Button(std::to_string(item.cost).c_str(), {float(row.items.size() == 1 ? 30 : 20), 20}))
         {
           item.onPurchase();
           Game::moneyCollected -= item.cost;
@@ -1545,6 +1543,7 @@ namespace
     }
 
     ma_engine_set_volume(&Audio::engine, 0.5f);
+    ma_engine_listener_set_world_up(&Audio::engine, 0, 0, 1, 0);
 
     if (ma_sound_init_from_file(&Audio::engine, (GetDataDirectory() / "audio/jump.wav").string().c_str(), 0, nullptr, nullptr, &Audio::jumpPrototype) != MA_SUCCESS)
     {
@@ -1909,9 +1908,7 @@ namespace
         auto pos = Physics::character->GetPosition();
         pos.SetY(pos.GetY() + 0.01f); // Unstick the player from the ground
         Physics::character->SetPosition(pos);
-        // TODO: play sound
         Audio::AddSound(Audio::jumpPrototype, MA_SOUND_FLAG_NO_SPATIALIZATION);
-        //ma_engine_play_sound(&Audio::engine, (GetDataDirectory() / "audio/jump.wav").string().c_str(), nullptr);
       }
 
       Physics::character->AddLinearVelocity(JPH::Vec3Arg(0, Game::playerJumpAcceleration * dtf, 0));
@@ -1926,7 +1923,9 @@ namespace
 
     Game::mainCamera.position = glm::mix(oldCameraPos, currentCameraPos, interpolant);
 
+    const auto mcDir = Game::mainCamera.GetForwardDir();
     ma_engine_listener_set_position(&Audio::engine, 0, currentCameraPos.x, currentCameraPos.y, currentCameraPos.z);
+    ma_engine_listener_set_direction(&Audio::engine, 0, mcDir.x, mcDir.y, mcDir.z);
 
     if (interpolant < lastInterpolant)
     {

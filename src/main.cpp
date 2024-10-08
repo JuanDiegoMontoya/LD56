@@ -458,7 +458,7 @@ void main()
     int irsDonations                   = 0;
 
     constexpr glm::vec4 terrainDefaultColor = {.2, .5, .1, 0};
-    constexpr glm::vec4 terrainFrockeyColor = {1, 1, 1, 15};
+    constexpr glm::vec4 terrainFrockeyColor = {.9, .9, .96, 15};
     float terrainDefaultFriction            = 0.2f;
     float terrainFrockeyFriction            = 0.0f;
 
@@ -1280,6 +1280,7 @@ namespace
   {
     Game::mainCamera.position = {0, 2, 0};
     Physics::character->SetPosition(JPH::Vec3Arg(0, 2, 0));
+    Physics::character->SetLinearVelocity(JPH::Vec3Arg(0, 0, 0));
     Game::secondsSurvived = 0;
     Game::timeSinceDied   = 0;
     Game::timeSinceSpawnedOpps = -2; // Give the player a moment before the afrocalypse starts
@@ -1616,6 +1617,14 @@ namespace
       {
         Game::SetState(Game::State::MAIN_MENU);
       }
+    }
+
+    if (auto pos = Physics::character->GetPosition(); pos.GetY() < -100 && Game::timeSinceDied <= 0)
+    {
+      pos.SetY(0);
+      Physics::character->SetPosition(pos);
+      Game::SetState(Game::State::DIED);
+      Game::deathMessageIndex = PCG::RandU32(PCG::state) % std::size(Game::deathMessages);
     }
     
     auto deleted = Game::registry.view<Game::ECS::DeferDelete>();

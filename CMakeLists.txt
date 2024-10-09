@@ -89,7 +89,7 @@ message(asdfJoltIncludeDir="${joltphysics_SOURCE_DIR}")
 
 target_include_directories(LD56_game PUBLIC	src	external ${joltphysics_SOURCE_DIR}/..)
 
-target_link_libraries(LD56_game glm EnTT::EnTT fwog glfw lib_glad imgui Jolt)
+target_link_libraries(LD56_game glm EnTT::EnTT fwog glfw lib_glad imgui Jolt Tracy::TracyClient)
 
 #message(JoltIncludeDir="${JoltIncludeDir}")
 

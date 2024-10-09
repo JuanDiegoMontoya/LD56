@@ -34,6 +34,8 @@
 #include <Jolt/Physics/Character/Character.h>
 #include <Jolt/Physics/Collision/ContactListener.h>
 
+#include <tracy/Tracy.hpp>
+
 #include <numeric>
 #include <filesystem>
 #include <optional>
@@ -361,6 +363,7 @@ void main()
     // Copies the input sound
     ma_sound* AddSound(const ma_sound& prototype, ma_uint32 soundFlags = 0)
     {
+      ZoneScoped;
       //ma_sound sound{};
       auto sound = new ma_sound();
       if (ma_sound_init_copy(&engine, &prototype, soundFlags, nullptr, sound) != MA_SUCCESS)
@@ -377,6 +380,7 @@ void main()
 
     void RemoveStaleSounds()
     {
+      ZoneScoped;
       std::erase_if(activeSounds,
         [](ma_sound* sound)
         {
@@ -707,6 +711,7 @@ namespace
 {
   void InitializeApplication()
   {
+    ZoneScoped;
     if (glfwInit() != GLFW_TRUE)
     {
       throw std::runtime_error("Failed to initialize GLFW");
@@ -919,6 +924,7 @@ namespace
 
   void TickRender([[maybe_unused]] double dt, float interpolant)
   {
+    ZoneScoped;
     static auto lastInterpolant = interpolant;
     auto renderMarker = Fwog::ScopedDebugMarker("TickRender");
 
@@ -933,36 +939,41 @@ namespace
     auto instanceData = std::vector<Render::InstanceUniforms>();
     auto instances    = std::vector<Instance>();
 
-    auto view = Game::registry.view<Game::ECS::Transform, Game::ECS::MeshRef>();
-    for (auto&& [entity, transform, meshRef] : view.each())
     {
-      instances.emplace_back(instanceData.size(), meshRef.mesh);
-
-      auto world_from_object = glm::translate(glm::identity<glm::mat4>(), transform.position) * glm::mat4_cast(transform.rotation) *
-                               glm::scale(glm::identity<glm::mat4>(), transform.scale);
-
-      auto renderModel = world_from_object;
-      if (auto* p = Game::registry.try_get<Game::ECS::PreviousModel>(entity))
+      ZoneScopedN("Gather instances");
+      auto view = Game::registry.view<Game::ECS::Transform, Game::ECS::MeshRef>();
+      instanceData.reserve(view.size_hint());
+      instances.reserve(view.size_hint());
+      for (auto&& [entity, transform, meshRef] : view.each())
       {
-        //renderModel = glm::mix(p->world_from_object, world_from_object, interpolant);
-        for (int i = 0; i < renderModel.length(); i++)
+        instances.emplace_back(instanceData.size(), meshRef.mesh);
+
+        auto world_from_object = glm::translate(glm::identity<glm::mat4>(), transform.position) * glm::mat4_cast(transform.rotation) *
+                                 glm::scale(glm::identity<glm::mat4>(), transform.scale);
+
+        auto renderModel = world_from_object;
+        if (auto* p = Game::registry.try_get<Game::ECS::PreviousModel>(entity))
         {
-          renderModel[i] = glm::mix(p->world_from_object[i], world_from_object[i], interpolant);
+          // renderModel = glm::mix(p->world_from_object, world_from_object, interpolant);
+          for (int i = 0; i < renderModel.length(); i++)
+          {
+            renderModel[i] = glm::mix(p->world_from_object[i], world_from_object[i], interpolant);
+          }
+
+          // Reset matrix
+          if (lastInterpolant > interpolant)
+          {
+            p->world_from_object = world_from_object;
+          }
         }
 
-        // Reset matrix
-        if (lastInterpolant > interpolant)
+        auto tintColor = glm::vec4(1);
+        if (auto* p = Game::registry.try_get<Game::ECS::Tint>(entity))
         {
-          p->world_from_object = world_from_object;
+          tintColor = p->color;
         }
+        instanceData.emplace_back(renderModel, tintColor);
       }
-
-      auto tintColor = glm::vec4(1);
-      if (auto* p = Game::registry.try_get<Game::ECS::Tint>(entity))
-      {
-        tintColor = p->color;
-      }
-      instanceData.emplace_back(renderModel, tintColor);
     }
 
     lastInterpolant = interpolant;
@@ -974,6 +985,7 @@ namespace
 
     if (!instanceData.empty())
     {
+      ZoneScopedN("Update instance buffer");
       Render::instanceBuffer->UpdateData(instanceData);
     }
 
@@ -981,82 +993,94 @@ namespace
     Render::frameUniforms.light_from_world = glm::ortho(-30.0f, 30.0f, -30.0f, 30.0f, -200.0f, 200.0f) * lightView_from_world;
     Render::frameUniforms.camPosition      = Game::mainCamera.position;
 
-    Fwog::Render(
-      Fwog::RenderInfo{
-        .name = "Shadow pass",
-        .depthAttachment =
-          Fwog::RenderDepthStencilAttachment{
-            .texture    = Render::shadowMap.value(),
-            .loadOp     = Fwog::AttachmentLoadOp::CLEAR,
-            .clearValue = {.depth = 1},
-          },
-      },
-      [&]
-      {
-        Render::frameUniforms.clip_from_world = Render::frameUniforms.light_from_world;
-        Render::frameUniformsBuffer->UpdateData(Render::frameUniforms);
-
-        Fwog::Cmd::BindGraphicsPipeline(Render::shadowPipeline.value());
-        Fwog::Cmd::BindStorageBuffer(1, Render::frameUniformsBuffer.value());
-        Fwog::Cmd::BindStorageBuffer(2, Render::instanceBuffer.value());
-
-        for (size_t i = 0; i < instances.size(); i++)
-        {
-          const auto& instance = instances[i];
-          Fwog::Cmd::BindIndexBuffer(instance.mesh->indexBuffer.value(), Fwog::IndexType::UNSIGNED_INT);
-          Fwog::Cmd::BindStorageBuffer(0, instance.mesh->vertexBuffer.value());
-          Fwog::Cmd::DrawIndexed((uint32_t)instance.mesh->indices.size(), 1, 0, 0, (uint32_t)i);
-        }
-      });
-
-    Fwog::RenderToSwapchain(
-      Fwog::SwapchainRenderInfo{
-        .name            = "Scene pass",
-        .viewport        = Fwog::Viewport{.drawRect{.offset = {0, 0}, .extent = {(uint32_t)App::windowSize.x, (uint32_t)App::windowSize.y}}},
-        .colorLoadOp     = Fwog::AttachmentLoadOp::CLEAR,
-        .clearColorValue = {.3f, .4f, .75f, 1.0f},
-        .depthLoadOp     = Fwog::AttachmentLoadOp::CLEAR,
-        .clearDepthValue = 1.0f,
-      },
-      [&]
-      {
-        auto projection = glm::perspective(glm::radians(Game::fovyDeg), (float)App::windowSize.x / (float)App::windowSize.y, 0.1f, 200.0f);
-        Render::frameUniforms.clip_from_world = projection * Game::mainCamera.GetViewMatrix();
-        Render::frameUniformsBuffer->UpdateData(Render::frameUniforms);
-
-        Fwog::Cmd::BindGraphicsPipeline(Render::pipeline.value());
-        Fwog::Cmd::BindStorageBuffer(1, Render::frameUniformsBuffer.value());
-        Fwog::Cmd::BindStorageBuffer(2, Render::instanceBuffer.value());
-        Fwog::Cmd::BindSampledImage(0,
-          Render::shadowMap.value(),
-          Fwog::Sampler({
-            .minFilter    = Fwog::Filter::LINEAR,
-            .magFilter    = Fwog::Filter::LINEAR,
-            .addressModeU = Fwog::AddressMode::CLAMP_TO_EDGE,
-            .addressModeV = Fwog::AddressMode::CLAMP_TO_EDGE,
-            .compareEnable = true,
-            .compareOp     = Fwog::CompareOp::LESS,
-          }));
-
-        for (size_t i = 0; i < instances.size(); i++)
-        {
-          const auto& instance = instances[i];
-          Fwog::Cmd::BindIndexBuffer(instance.mesh->indexBuffer.value(), Fwog::IndexType::UNSIGNED_INT);
-          Fwog::Cmd::BindStorageBuffer(0, instance.mesh->vertexBuffer.value());
-          Fwog::Cmd::DrawIndexed((uint32_t)instance.mesh->indices.size(), 1, 0, 0, (uint32_t)i);
-        }
-      });
-
-    ImGui::Render();
-    auto* imguiDrawData = ImGui::GetDrawData();
-    if (imguiDrawData->CmdListsCount > 0)
     {
-      auto marker = Fwog::ScopedDebugMarker("UI");
-      glDisable(GL_FRAMEBUFFER_SRGB);
-      glBindFramebuffer(GL_FRAMEBUFFER, 0);
-      ImGui_ImplOpenGL3_RenderDrawData(imguiDrawData);
+      ZoneScopedN("Shadow pass");
+      Fwog::Render(
+        Fwog::RenderInfo{
+          .name = "Shadow pass",
+          .depthAttachment =
+            Fwog::RenderDepthStencilAttachment{
+              .texture    = Render::shadowMap.value(),
+              .loadOp     = Fwog::AttachmentLoadOp::CLEAR,
+              .clearValue = {.depth = 1},
+            },
+        },
+        [&]
+        {
+          Render::frameUniforms.clip_from_world = Render::frameUniforms.light_from_world;
+          Render::frameUniformsBuffer->UpdateData(Render::frameUniforms);
+
+          Fwog::Cmd::BindGraphicsPipeline(Render::shadowPipeline.value());
+          Fwog::Cmd::BindStorageBuffer(1, Render::frameUniformsBuffer.value());
+          Fwog::Cmd::BindStorageBuffer(2, Render::instanceBuffer.value());
+
+          for (size_t i = 0; i < instances.size(); i++)
+          {
+            const auto& instance = instances[i];
+            Fwog::Cmd::BindIndexBuffer(instance.mesh->indexBuffer.value(), Fwog::IndexType::UNSIGNED_INT);
+            Fwog::Cmd::BindStorageBuffer(0, instance.mesh->vertexBuffer.value());
+            Fwog::Cmd::DrawIndexed((uint32_t)instance.mesh->indices.size(), 1, 0, 0, (uint32_t)i);
+          }
+        });
     }
-    glfwSwapBuffers(App::window);
+
+    {
+      ZoneScopedN("Scene pass");
+      Fwog::RenderToSwapchain(
+        Fwog::SwapchainRenderInfo{
+          .name            = "Scene pass",
+          .viewport        = Fwog::Viewport{.drawRect{.offset = {0, 0}, .extent = {(uint32_t)App::windowSize.x, (uint32_t)App::windowSize.y}}},
+          .colorLoadOp     = Fwog::AttachmentLoadOp::CLEAR,
+          .clearColorValue = {.3f, .4f, .75f, 1.0f},
+          .depthLoadOp     = Fwog::AttachmentLoadOp::CLEAR,
+          .clearDepthValue = 1.0f,
+        },
+        [&]
+        {
+          auto projection = glm::perspective(glm::radians(Game::fovyDeg), (float)App::windowSize.x / (float)App::windowSize.y, 0.1f, 200.0f);
+          Render::frameUniforms.clip_from_world = projection * Game::mainCamera.GetViewMatrix();
+          Render::frameUniformsBuffer->UpdateData(Render::frameUniforms);
+
+          Fwog::Cmd::BindGraphicsPipeline(Render::pipeline.value());
+          Fwog::Cmd::BindStorageBuffer(1, Render::frameUniformsBuffer.value());
+          Fwog::Cmd::BindStorageBuffer(2, Render::instanceBuffer.value());
+          Fwog::Cmd::BindSampledImage(0,
+            Render::shadowMap.value(),
+            Fwog::Sampler({
+              .minFilter     = Fwog::Filter::LINEAR,
+              .magFilter     = Fwog::Filter::LINEAR,
+              .addressModeU  = Fwog::AddressMode::CLAMP_TO_EDGE,
+              .addressModeV  = Fwog::AddressMode::CLAMP_TO_EDGE,
+              .compareEnable = true,
+              .compareOp     = Fwog::CompareOp::LESS,
+            }));
+
+          for (size_t i = 0; i < instances.size(); i++)
+          {
+            const auto& instance = instances[i];
+            Fwog::Cmd::BindIndexBuffer(instance.mesh->indexBuffer.value(), Fwog::IndexType::UNSIGNED_INT);
+            Fwog::Cmd::BindStorageBuffer(0, instance.mesh->vertexBuffer.value());
+            Fwog::Cmd::DrawIndexed((uint32_t)instance.mesh->indices.size(), 1, 0, 0, (uint32_t)i);
+          }
+        });
+    }
+
+    {
+      ZoneScopedN("Render UI");
+      ImGui::Render();
+      auto* imguiDrawData = ImGui::GetDrawData();
+      if (imguiDrawData->CmdListsCount > 0)
+      {
+        auto marker = Fwog::ScopedDebugMarker("UI");
+        glDisable(GL_FRAMEBUFFER_SRGB);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        ImGui_ImplOpenGL3_RenderDrawData(imguiDrawData);
+      }
+    }
+    {
+      ZoneScopedN("SwapBuffers");
+      glfwSwapBuffers(App::window);
+    }
   }
 
   void ShowShopInterface();
@@ -1064,6 +1088,7 @@ namespace
 
   void TickUI([[maybe_unused]] double dt)
   {
+    ZoneScoped;
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
@@ -1221,6 +1246,7 @@ namespace
 
   auto CreateMeshShape(const Render::Mesh& mesh)
   {
+    ZoneScoped;
     auto vertices  = JPH::Array<JPH::Float3>();
     auto triangles = JPH::Array<JPH::IndexedTriangle>();
 
@@ -1245,6 +1271,7 @@ namespace
 
   void InitializePhysics()
   {
+    ZoneScoped;
     Game::registry.on_construct<Game::ECS::PhysicsKinematic>().connect<AddBodyKinematic>();
     Game::registry.on_construct<Game::ECS::PhysicsDynamic>().connect<AddBodyDynamic>();
     Game::registry.on_destroy<Game::ECS::PhysicsKinematic>().connect<RemoveBodyKinematic>();
@@ -1270,6 +1297,7 @@ namespace
 
   void TerminatePhysics()
   {
+    ZoneScoped;
     JPH::UnregisterTypes();
     delete JPH::Factory::sInstance;
   }
@@ -1375,6 +1403,7 @@ namespace
 
   void PopulateShop()
   {
+    ZoneScoped;
     Game::ShopRow speedRow;
     for (int i = 0; i < 5; i++)
     {
@@ -1455,6 +1484,7 @@ namespace
 
   void ShowShopInterface()
   {
+    ZoneScoped;
     ImGui::SeparatorText("Bugge Shoppe");
     ImGui::Text("Currency: %d D", Game::moneyCollected);
     if (ImGui::Button("Refund all"))
@@ -1535,6 +1565,7 @@ namespace
 
   void InitializeGame()
   {
+    ZoneScoped;
     PCG::state = PCG::Hash((uint32_t)std::time(nullptr));
 
     if (ma_engine_init(nullptr, &Audio::engine) != MA_SUCCESS)
@@ -1703,6 +1734,7 @@ namespace
 
   void TickGameFixed(double dt)
   {
+    ZoneScoped;
     Audio::RemoveStaleSounds();
 
     if (Game::state != Game::State::GAME && Game::state != Game::State::DIED)
@@ -1738,6 +1770,7 @@ namespace
     auto config = GetDifficultyConfig(Game::difficulty);
     if (Game::timeSinceSpawnedDung > config.timeBetweenDungDrops)
     {
+      ZoneScopedN("Spawn dung");
       Game::timeSinceSpawnedDung -= config.timeBetweenDungDrops;
       for (int i = 0; i < config.numDungPerDrop; i++)
       {
@@ -1751,6 +1784,7 @@ namespace
 
     if (Game::timeSinceSpawnedOpps > config.timeBetweenOppDrops)
     {
+      ZoneScopedN("Spawn frogs");
       Game::timeSinceSpawnedOpps -= config.timeBetweenOppDrops;
       for (int i = 0; i < config.numOppsPerDrop; i++)
       {
@@ -1762,58 +1796,67 @@ namespace
       }
     }
 
-    for (auto [entity, transform] : Game::registry.view<Game::ECS::Frog, Game::ECS::Transform>().each())
     {
-      if (transform.position.y < -100)
+      ZoneScopedN("Update entities");
+      for (auto [entity, transform] : Game::registry.view<Game::ECS::Frog, Game::ECS::Transform>().each())
       {
-        Game::registry.destroy(entity);
-      }
-    }
-
-    for (auto [entity, transform] : Game::registry.view<Game::ECS::Dung, Game::ECS::Transform>().each())
-    {
-      if (transform.position.y < -100)
-      {
-        Game::registry.destroy(entity);
-      }
-    }
-
-    for (auto [entity] : Game::registry.view<Game::ECS::PhysicsKinematicAdded>().each())
-    {
-      const auto& body = Game::registry.get<Game::ECS::PhysicsKinematic>(entity).body;
-      Physics::body_interface->AddBody(body, JPH::EActivation::DontActivate);
-      Physics::bodyToEntity.emplace(body, entity);
-      Game::registry.remove<Game::ECS::PhysicsKinematicAdded>(entity);
-    }
-    
-    for (auto [entity] : Game::registry.view<Game::ECS::PhysicsDynamicAdded>().each())
-    {
-      // HACK: don't add body to system here since we want to set linear velocity upon creation
-      const auto& body = Game::registry.get<Game::ECS::PhysicsDynamic>(entity).body;
-      Physics::bodyToEntity.emplace(body, entity);
-      Game::registry.remove<Game::ECS::PhysicsDynamicAdded>(entity);
-    }
-    
-    Physics::engine.Update(float(dt), 1, Physics::tempAllocator, Physics::jobSystem);
-    Physics::character->PostSimulation(.01f);
-
-    auto bodies = JPH::BodyIDVector();
-    //Physics::engine.GetActiveBodies(JPH::EBodyType::RigidBody, bodies);
-    Physics::engine.GetBodies(bodies);
-
-    for (const auto& body : bodies)
-    {
-      if (auto it = Physics::bodyToEntity.find(body); it != Physics::bodyToEntity.end())
-      {
-        auto entity = it->second;
-
-        if (auto* transform = Game::registry.try_get<Game::ECS::Transform>(entity))
+        if (transform.position.y < -100)
         {
-          auto pos = JPH::RVec3();
-          auto rot = JPH::Quat();
-          Physics::body_interface->GetPositionAndRotation(body, pos, rot);
-          transform->position = { pos.GetX(), pos.GetY(), pos.GetZ() };
-          transform->rotation = { rot.GetW(), rot.GetX(), rot.GetY(), rot.GetZ() };
+          Game::registry.destroy(entity);
+        }
+      }
+
+      for (auto [entity, transform] : Game::registry.view<Game::ECS::Dung, Game::ECS::Transform>().each())
+      {
+        if (transform.position.y < -100)
+        {
+          Game::registry.destroy(entity);
+        }
+      }
+
+      for (auto [entity] : Game::registry.view<Game::ECS::PhysicsKinematicAdded>().each())
+      {
+        const auto& body = Game::registry.get<Game::ECS::PhysicsKinematic>(entity).body;
+        Physics::body_interface->AddBody(body, JPH::EActivation::DontActivate);
+        Physics::bodyToEntity.emplace(body, entity);
+        Game::registry.remove<Game::ECS::PhysicsKinematicAdded>(entity);
+      }
+
+      for (auto [entity] : Game::registry.view<Game::ECS::PhysicsDynamicAdded>().each())
+      {
+        // HACK: don't add body to system here since we want to set linear velocity upon creation
+        const auto& body = Game::registry.get<Game::ECS::PhysicsDynamic>(entity).body;
+        Physics::bodyToEntity.emplace(body, entity);
+        Game::registry.remove<Game::ECS::PhysicsDynamicAdded>(entity);
+      }
+    }
+
+    {
+      ZoneScopedN("Update physics");
+      Physics::engine.Update(float(dt), 1, Physics::tempAllocator, Physics::jobSystem);
+      Physics::character->PostSimulation(.01f);
+    }
+
+    {
+      ZoneScopedN("Update transforms from physics");
+      auto bodies = JPH::BodyIDVector();
+      // Physics::engine.GetActiveBodies(JPH::EBodyType::RigidBody, bodies);
+      Physics::engine.GetBodies(bodies);
+
+      for (const auto& body : bodies)
+      {
+        if (auto it = Physics::bodyToEntity.find(body); it != Physics::bodyToEntity.end())
+        {
+          auto entity = it->second;
+
+          if (auto* transform = Game::registry.try_get<Game::ECS::Transform>(entity))
+          {
+            auto pos = JPH::RVec3();
+            auto rot = JPH::Quat();
+            Physics::body_interface->GetPositionAndRotation(body, pos, rot);
+            transform->position = {pos.GetX(), pos.GetY(), pos.GetZ()};
+            transform->rotation = {rot.GetW(), rot.GetX(), rot.GetY(), rot.GetZ()};
+          }
         }
       }
     }
@@ -1821,6 +1864,7 @@ namespace
 
   void TickGameVariable([[maybe_unused]] double dt, float interpolant)
   {
+    ZoneScoped;
     // CHEAT: unlock next difficulty
     if (ImGui::GetKeyPressedAmount(ImGuiKey_F5, 100000, 1))
     {
@@ -1946,11 +1990,13 @@ namespace
 
 void MainLoop()
 {
+  ZoneScoped;
   constexpr double GAME_TICK = 1.0 / 60.0;
   double gameTickAccum = 0;
   auto prevTime = glfwGetTime();
   while(!glfwWindowShouldClose(App::window))
   {
+    ZoneScopedN("Frame");
     auto curTime = glfwGetTime();
     auto dt = curTime - prevTime;
     prevTime = curTime;
@@ -1958,7 +2004,10 @@ void MainLoop()
     dt = glm::min(dt, GAME_TICK);
 
     App::cursorOffset = {};
-    glfwPollEvents();
+    {
+      ZoneScopedN("Poll input");
+      glfwPollEvents();
+    }
 
     gameTickAccum += dt;
     if (gameTickAccum >= GAME_TICK)

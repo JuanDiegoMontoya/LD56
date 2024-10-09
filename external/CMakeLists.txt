@@ -36,7 +36,13 @@ FetchContent_Declare(
     GIT_TAG        v3.13.2
 )
 
-FetchContent_MakeAvailable(glm glfw fwog EnTT)
+FetchContent_Declare(
+    tracy
+    GIT_REPOSITORY  https://github.com/wolfpld/tracy.git
+    GIT_TAG         v0.11.1
+)
+
+FetchContent_MakeAvailable(glm glfw fwog EnTT tracy)
 
 FetchContent_GetProperties(imgui)
 if(NOT imgui_POPULATED)

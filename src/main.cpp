@@ -339,10 +339,10 @@ void main()
 
     JPH::TempAllocatorImpl* tempAllocator{}; 
     JPH::JobSystemThreadPool* jobSystem{};
-    auto broad_phase_layer_interface = BPLayerInterfaceImpl();
-    auto object_vs_broadphase_layer_filter = ObjectVsBroadPhaseLayerFilterImpl();
-    auto object_vs_object_layer_filter = ObjectLayerPairFilterImpl();
-    auto engine = JPH::PhysicsSystem();
+    BPLayerInterfaceImpl* broad_phase_layer_interface{};
+    ObjectVsBroadPhaseLayerFilterImpl* object_vs_broadphase_layer_filter{};
+    ObjectLayerPairFilterImpl* object_vs_object_layer_filter{};
+    JPH::PhysicsSystem* engine{};
     JPH::BodyInterface* body_interface{};
     std::unordered_map<JPH::BodyID, entt::entity, HashBodyID> bodyToEntity;
     //JPH::CharacterVirtual* character{};
@@ -1290,9 +1290,13 @@ namespace
     constexpr JPH::uint cNumBodyMutexes = 0;
     constexpr JPH::uint cMaxBodyPairs = 5000;
     constexpr JPH::uint cMaxContactConstraints = 5000;
-    Physics::engine.Init(cMaxBodies, cNumBodyMutexes, cMaxBodyPairs, cMaxContactConstraints, Physics::broad_phase_layer_interface, Physics::object_vs_broadphase_layer_filter, Physics::object_vs_object_layer_filter);
+    Physics::broad_phase_layer_interface       = new Physics::BPLayerInterfaceImpl();
+    Physics::object_vs_broadphase_layer_filter = new Physics::ObjectVsBroadPhaseLayerFilterImpl();
+    Physics::object_vs_object_layer_filter     = new Physics::ObjectLayerPairFilterImpl();
+    Physics::engine                            = new JPH::PhysicsSystem();
+    Physics::engine->Init(cMaxBodies, cNumBodyMutexes, cMaxBodyPairs, cMaxContactConstraints, *Physics::broad_phase_layer_interface, *Physics::object_vs_broadphase_layer_filter, *Physics::object_vs_object_layer_filter);
 
-    Physics::body_interface = &Physics::engine.GetBodyInterface();
+    Physics::body_interface = &Physics::engine->GetBodyInterface();
   }
 
   void TerminatePhysics()
@@ -1624,7 +1628,7 @@ namespace
     characterSettings.mLayer = Physics::Layers::MOVING;
     characterSettings.mShape = new JPH::SphereShape(0.5f);
     characterSettings.mFriction = Game::playerFriction;
-    Physics::character = new JPH::Character(&characterSettings, JPH::Vec3Arg(0, 2, 0), JPH::Quat::sIdentity(), 0, &Physics::engine);
+    Physics::character = new JPH::Character(&characterSettings, JPH::Vec3Arg(0, 2, 0), JPH::Quat::sIdentity(), 0, Physics::engine);
     Physics::body_interface->SetRestitution(Physics::character->GetBodyID(), 0);
     Physics::character->AddToPhysicsSystem();
     Physics::character->SetShape(new JPH::CapsuleShape(0.5f, 0.2f), FLT_MAX);
@@ -1712,9 +1716,9 @@ namespace
         }
       }
     };
-    Physics::engine.SetContactListener(new ContactListenerImpl());
+    Physics::engine->SetContactListener(new ContactListenerImpl());
 
-    Physics::engine.OptimizeBroadPhase();
+    Physics::engine->OptimizeBroadPhase();
   }
 
   void TerminateGame()
@@ -1833,7 +1837,7 @@ namespace
 
     {
       ZoneScopedN("Update physics");
-      Physics::engine.Update(float(dt), 1, Physics::tempAllocator, Physics::jobSystem);
+      Physics::engine->Update(float(dt), 1, Physics::tempAllocator, Physics::jobSystem);
       Physics::character->PostSimulation(.01f);
     }
 
@@ -1841,7 +1845,7 @@ namespace
       ZoneScopedN("Update transforms from physics");
       auto bodies = JPH::BodyIDVector();
       // Physics::engine.GetActiveBodies(JPH::EBodyType::RigidBody, bodies);
-      Physics::engine.GetBodies(bodies);
+      Physics::engine->GetBodies(bodies);
 
       for (const auto& body : bodies)
       {
@@ -2026,13 +2030,24 @@ void MainLoop()
 
 int main()
 {
-  InitializeApplication();
-  InitializeRenderer();
-  InitializePhysics();
-  InitializeGame();
-  MainLoop();
-  TerminateGame();
-  TerminatePhysics();
-  TerminateRenderer();
-  TerminateApplication();
+  try
+  {
+    InitializeApplication();
+    InitializeRenderer();
+    InitializePhysics();
+    InitializeGame();
+    MainLoop();
+    TerminateGame();
+    TerminatePhysics();
+    TerminateRenderer();
+    TerminateApplication();
+  }
+  catch(std::exception& e)
+  {
+    printf("Application crashed.\nReason: %s", e.what());
+  }
+  catch(...)
+  {
+    printf("Application crashed due to an unknown reason");
+  }
 }
